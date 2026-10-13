@@ -50,3 +50,48 @@ include = ["chronosrl*"]
 
 [tool.setuptools.package-data]
 "*" = ["*.xml", "assets/*.xml", "LICENSE"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.pypi-dependencies]
+chronosrl = { path = ".", editable = true }
+
+[tool.pixi.environments]
+benchmark = { features = ["benchmark"] }
+go2 = { features = ["go2"] }
+
+[tool.pixi.feature.benchmark.dependencies]
+python = "3.10.*"
+
+[tool.pixi.feature.benchmark.activation.env]
+# Prefer the environment's CUDA assembler over the system CUDA installation.
+PATH = "$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/cuda_nvcc/bin:$PATH"
+
+[tool.pixi.feature.benchmark.pypi-dependencies]
+# Declare the legacy CUDA extra explicitly to avoid extra-name normalization issues.
+jax = "==0.4.23"
+jaxlib = "==0.4.23+cuda12.cudnn89"
+nvidia-cublas-cu12 = ">=12.2.5.6"
+nvidia-cuda-cupti-cu12 = ">=12.2.142"
+nvidia-cuda-nvcc-cu12 = ">=12.2.140"
+nvidia-cuda-runtime-cu12 = ">=12.2.140"
+nvidia-cudnn-cu12 = "==8.9.7.29"
+nvidia-cufft-cu12 = ">=11.0.8.103"
+nvidia-cusolver-cu12 = ">=11.5.2"
+nvidia-cusparse-cu12 = ">=12.1.2.141"
+nvidia-nccl-cu12 = ">=2.18.3"
+nvidia-nvjitlink-cu12 = ">=12.2"
+
+[tool.pixi.feature.benchmark.pypi-options]
+index-url = "https://pypi.org/simple"
+find-links = [
+    { url = "https://storage.googleapis.com/jax-releases/jax_cuda_releases.html" },
+]
+
+[tool.pixi.feature.go2.dependencies]
+python = "3.11.*"
+
+[tool.pixi.feature.go2.pypi-dependencies]
+jax = { version = "==0.7.2", extras = ["cuda12"] }
