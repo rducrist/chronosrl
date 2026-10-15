@@ -30,6 +30,22 @@ benchmark = [
     "numpy==1.26.4",
     "scipy==1.12.0",
 ]
+
+crazyflow = [
+    "crazyflow @ git+https://github.com/learnsyslab/crazyflow.git@d28ec70", # pinned to what is essentially 0.4
+    "numpy>=2.0.0,<3",
+    "jax[cuda]>=0.7.2,!=0.10.2", # 0.10.2 XLA:GPU miscompiles for larger swarms
+    "mujoco==3.3.7",
+    "fire>=0.7.1,<0.8",
+    "ml-collections",
+    "polars>=1.35.0,<2",
+    "array-api-compat",
+    "array-api-extra",
+    "toml>=0.10.2",
+    "imageio[ffmpeg]>=2.37.0",
+    "tqdm",
+]
+
 go2 = [
     "jax==0.7.2",
     "jaxlib==0.7.2",
@@ -61,9 +77,18 @@ chronosrl = { path = ".", editable = true }
 [tool.pixi.environments]
 benchmark = { features = ["benchmark"] }
 go2 = { features = ["go2"] }
+crazyflow = { features = ["crazyflow"] }
 
 [tool.pixi.feature.benchmark.dependencies]
 python = "3.10.*"
+[tool.pixi.feature.crazyflow.dependencies]
+python = "<3.14" # MuJoCo has no wheels for Python 3.14
+h5py = ">=3.16.0,<4"
+pytest = ">=9.1.1,<10"
+
+[tool.pytest.ini_options]
+markers = ["integration: tests that build and step the simulator"]
+
 
 [tool.pixi.feature.benchmark.activation.env]
 # Prefer the environment's CUDA assembler over the system CUDA installation.
