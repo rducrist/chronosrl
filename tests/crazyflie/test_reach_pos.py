@@ -9,8 +9,7 @@ from chronosrl.environments.crazyflow.drone_reach_pos_env import CrazyflowPositi
 def make_env(nr_envs=1):
     config = get_config("crazyflow_position")
     config.device = "cpu"
-    return CrazyflowPositionEnv(config, 
-                                nr_envs)
+    return CrazyflowPositionEnv(config, nr_envs)
 
 
 @pytest.mark.integration
