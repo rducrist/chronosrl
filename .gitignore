@@ -4,3 +4,7 @@ __pycache__/
 runs/
 wandb/
 experiments/*.log
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+

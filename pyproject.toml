@@ -120,3 +120,60 @@ python = "3.11.*"
 
 [tool.pixi.feature.go2.pypi-dependencies]
 jax = { version = "==0.7.2", extras = ["cuda12"] }
+
+[tool.ruff]
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".git",
+    ".git-rewrite",
+    ".ipynb_checkpoints",
+    ".pyenv",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".venv",
+    ".vscode",
+    "__pypackages__",
+    "_build",
+    "build",
+    "dist",
+    "site-packages",
+    "venv",
+    "docs/conftest.py",
+]
+
+line-length = 100
+indent-width = 4
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "D", "TCH", "ANN"]
+ignore = ["ANN401"]
+fixable = ["ALL"]
+unfixable = []
+
+[tool.ruff.lint.isort]  # Prevent ruff from reporting conflicting settings with isort
+split-on-trailing-comma = false
+
+[tool.ruff.lint.per-file-ignores]
+"benchmark/*" = ["D100", "D103"]
+"tests/*" = ["D100", "D103", "D104"]
+"examples/*" = ["D100", "D103"]
+"tutorials/*" = ["D", "ANN"]
+# TODO: Remove once everything is stable and document
+"crazyflow/*" = ["D100", "D101", "D102", "D104", "D107"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.flake8-annotations]
+suppress-dummy-args = true
+suppress-none-returning = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = true
+line-ending = "auto"
+docstring-code-format = true
+docstring-code-line-length = "dynamic"
