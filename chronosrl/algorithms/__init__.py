@@ -1,5 +1,6 @@
-from chronosrl.algorithms import chronosrl, srl, crl, accrl
+"""Registry of the available algorithms, mapping a name to `(get_config, algorithm class)`."""
 
+from chronosrl.algorithms import accrl, chronosrl, crl, srl
 
 ALGORITHMS = {
     "chronosrl": (chronosrl.get_config, chronosrl.ChronoSRL),

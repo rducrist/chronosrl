@@ -140,6 +140,9 @@ exclude = [
     "site-packages",
     "venv",
     "docs/conftest.py",
+    # Upstream / third-party environments, kept as-is to ease merging
+    "chronosrl/environments/go2",
+    "chronosrl/environments/jaxgcrl",
 ]
 
 line-length = 100

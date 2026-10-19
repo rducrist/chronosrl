@@ -1,8 +1,11 @@
+"""Command-line entry point: assembles runner/algorithm/environment configs and trains."""
+
 import json
 import os
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 from absl import app
 from ml_collections import config_dict, config_flags
@@ -14,7 +17,8 @@ from chronosrl.environments import get_environment
 from chronosrl.trainer import Trainer
 
 
-def get_runner_config():
+def get_runner_config() -> config_dict.ConfigDict:
+    """Return the default runner config (logging, wandb and checkpointing options)."""
     config = config_dict.ConfigDict()
 
     config.project_name = "chronosrl"
@@ -27,21 +31,27 @@ def get_runner_config():
     return config
 
 
-def load_experiment_config(path, algorithm_name):
+def load_experiment_config(
+    path: str | Path, algorithm_name: str
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Read a TOML experiment file into (runner, algorithm, environment) override dicts."""
     config = load_toml(path)
 
     # [algorithm] applies to every algorithm, [algorithm.<name>] only to that one
     algorithm = config.get("algorithm", {})
-    algorithm_overrides = {
-        key: value for key, value in algorithm.items() if key not in ALGORITHMS
-    }
+    algorithm_overrides = {key: value for key, value in algorithm.items() if key not in ALGORITHMS}
     algorithm_overrides.update(algorithm.get(algorithm_name, {}))
 
     return config.get("runner", {}), algorithm_overrides, config["environment"]
 
 
 class Runner:
-    def __init__(self):
+    """Builds the configs as absl config flags and launches training."""
+
+    def __init__(self) -> None:
+        """Resolve algorithm, environment and config file, then define the config flags."""
+        # These are read from sys.argv before absl parses the flags, since they decide
+        # which default configs the flags are built from.
         algorithm_name = self.pop_argument("algorithm.name", "srl")
         environment_name = self.pop_argument("environment.name", "crazyflow_position")
         config_path = self.pop_argument("config", None)
@@ -55,8 +65,8 @@ class Runner:
         runner_config = get_runner_config()
         algorithm_config = get_algorithm_config(algorithm_name)
         if Path(config_path).exists():
-            runner_overrides, algorithm_overrides, environment_config = (
-                load_experiment_config(config_path, algorithm_name)
+            runner_overrides, algorithm_overrides, environment_config = load_experiment_config(
+                config_path, algorithm_name
             )
             runner_config.update(runner_overrides)
             algorithm_config.update(algorithm_overrides)
@@ -69,18 +79,15 @@ class Runner:
             )
             environment_config = self.environment.get_config(environment_name)
 
-        self.runner_config_flag = config_flags.DEFINE_config_dict(
-            "runner", runner_config
-        )
-        self.algorithm_config_flag = config_flags.DEFINE_config_dict(
-            "algorithm", algorithm_config
-        )
+        self.runner_config_flag = config_flags.DEFINE_config_dict("runner", runner_config)
+        self.algorithm_config_flag = config_flags.DEFINE_config_dict("algorithm", algorithm_config)
         self.environment_config_flag = config_flags.DEFINE_config_dict(
             "environment", environment_config
         )
 
     @staticmethod
-    def pop_argument(name, default):
+    def pop_argument(name: str, default: str | None) -> str | None:
+        """Remove `--name=value` from sys.argv and return its value, or `default` if absent."""
         for argument in sys.argv:
             if argument.startswith(f"--{name}="):
                 sys.argv.remove(argument)
@@ -88,9 +95,11 @@ class Runner:
         return default
 
     def run(self):
+        """Parse the flags with absl and run `train`."""
         app.run(self.train)
 
     def train(self, _):
+        """Train with the parsed configs (absl entry point; argv is unused)."""
         config = config_dict.ConfigDict()
         config.runner = self.runner_config_flag.value
         config.algorithm = self.algorithm_config_flag.value

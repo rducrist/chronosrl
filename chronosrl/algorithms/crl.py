@@ -1,3 +1,7 @@
+"""CRL: contrastive RL with a negative-L2-distance critic trained with InfoNCE."""
+
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from ml_collections import config_dict
@@ -5,7 +9,8 @@ from ml_collections import config_dict
 from chronosrl.networks import ContrastiveCritic, pairwise_distances
 
 
-def get_config(algorithm_name):
+def get_config(algorithm_name: str) -> config_dict.ConfigDict:
+    """Default CRL hyperparameters."""
     config = config_dict.ConfigDict()
 
     config.name = algorithm_name
@@ -35,23 +40,48 @@ def get_config(algorithm_name):
 
 
 class CRL:
-    def __init__(self, config, env):
+    """Contrastive RL: the critic is the negative L2 distance between the embeddings."""
+
+    def __init__(self, config: config_dict.ConfigDict, env: Any) -> None:
+        """Builds the contrastive critic."""
         self.state_dim = env.state_dim
-        self.critic = ContrastiveCritic(config.width, config.depth, config.embedding_dim, config.embedding_layer_norm, config.goal_constant_input)
+        self.critic = ContrastiveCritic(
+            config.width,
+            config.depth,
+            config.embedding_dim,
+            config.embedding_layer_norm,
+            config.goal_constant_input,
+        )
         self.logsumexp_penalty = config.logsumexp_penalty
         self.occupancy_edges = None
 
-
-    def critic_loss(self, params, batch):
-        z_sa, z_g = self.critic.apply(params, batch["observation"][:, :self.state_dim], batch["action"], batch["goal"])
+    def critic_loss(
+        self, params: Any, batch: dict[str, jax.Array]
+    ) -> tuple[jax.Array, dict[str, jax.Array]]:
+        """InfoNCE with in-batch negatives plus a logsumexp penalty; returns loss and metrics."""
+        z_sa, z_g = self.critic.apply(
+            params, batch["observation"][:, : self.state_dim], batch["action"], batch["goal"]
+        )
+        # Logits are -distances[i, j]: row i's positive is its own goal (the diagonal),
+        # the other goals of the batch are its negatives
         distances = pairwise_distances(z_sa, z_g)
         logsumexp = jax.nn.logsumexp(-distances, axis=1)
+        # Only samples whose goal is reached within the window count as positives
         positive = batch["is_event"] * batch["valid"]
-        infonce = jnp.sum(positive * (jnp.diagonal(distances) + logsumexp)) / jnp.maximum(jnp.sum(positive), 1.0)
-        loss = infonce + self.logsumexp_penalty * jnp.mean(logsumexp ** 2)
+        infonce = jnp.sum(positive * (jnp.diagonal(distances) + logsumexp)) / jnp.maximum(
+            jnp.sum(positive), 1.0
+        )
+        loss = infonce + self.logsumexp_penalty * jnp.mean(logsumexp**2)
         return loss, {"loss/infonce_loss": infonce, "loss/critic_loss": loss}
 
-
-    def actor_value(self, params, state, action, goal, batch):
+    def actor_value(
+        self,
+        params: Any,
+        state: jax.Array,
+        action: jax.Array,
+        goal: jax.Array,
+        batch: dict[str, jax.Array],
+    ) -> jax.Array:
+        """Negative L2 distance between the state-action and goal embeddings (`batch` unused)."""
         z_sa, z_g = self.critic.apply(params, state, action, goal)
         return -jnp.sqrt(jnp.sum((z_sa - z_g) ** 2, axis=-1) + 1e-12)

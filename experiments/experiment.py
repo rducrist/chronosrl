@@ -1,6 +1,8 @@
-# Run like this 
-# pixi run -e crazyflow python experiments/experiment.py --config=configs/crazyflow_position_hard.toml
+"""Training entry point: builds a Runner from the command-line flags and runs it."""
 
+# Run like this
+# pixi run -e crazyflow python experiments/experiment.py \
+#     --config=configs/crazyflow_position.toml
 
 from chronosrl.runner import Runner
 

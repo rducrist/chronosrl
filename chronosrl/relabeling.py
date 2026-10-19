@@ -1,9 +1,19 @@
-import numpy as np
+"""Hindsight relabeling of replay windows into goal hitting-time (survival) training batches."""
+
+from collections.abc import Callable
+from typing import Any
+
 import jax
 import jax.numpy as jnp
+import numpy as np
+from ml_collections import config_dict
 
 
-def geometric_bins(horizon, nr_bins):
+def geometric_bins(horizon: int, nr_bins: int) -> np.ndarray:
+    """Time-bin edges from 0 to `horizon`, geometrically spaced (unit bins if `nr_bins >= horizon`).
+
+    Edges that coincide after rounding are merged, so there can be fewer than `nr_bins` bins.
+    """
     if nr_bins >= horizon:
         return np.arange(horizon + 1)
     edges = jnp.round(jnp.power(horizon / 1.0, 1.0 / nr_bins) ** jnp.arange(nr_bins + 1)).astype(
@@ -12,13 +22,26 @@ def geometric_bins(horizon, nr_bins):
     return np.unique(np.concatenate([[0, horizon], np.clip(np.asarray(edges), 0, horizon)]))
 
 
-def bin_discounts(edges, gamma):
+def bin_discounts(edges: np.ndarray, gamma: float) -> jax.Array:
+    """Summed discount `sum_k gamma**k` over each bin `[edges[i], edges[i + 1])`."""
     edges = jnp.asarray(edges)
     starts, lengths = edges[:-1].astype(jnp.float32), (edges[1:] - edges[:-1]).astype(jnp.float32)
     return jnp.power(gamma, starts) * (1.0 - jnp.power(gamma, lengths)) / (1.0 - gamma)
 
 
-def make_relabel_fn(config, env, occupancy_edges=None):
+def make_relabel_fn(
+    config: config_dict.ConfigDict, env: Any, occupancy_edges: np.ndarray | None = None
+) -> Callable[[dict[str, jax.Array], jax.Array], dict[str, jax.Array]]:
+    """Builds the function that turns a replay window into a relabeled training batch.
+
+    Args:
+        config: Algorithm config (goal sampling, window, action chunk length, cost weight, ...).
+        env: Training environment, providing `state_dim`, `goal_indices` and `goal_radius`.
+        occupancy_edges: Time-bin edges of the occupancy targets, or None to skip them.
+
+    Returns:
+        `relabel(transitions, key)` for a single window; the caller vmaps it over windows.
+    """
     state_dim = env.state_dim
     goal_start, goal_end = env.goal_indices
     goal_size = goal_end - goal_start
@@ -30,7 +53,21 @@ def make_relabel_fn(config, env, occupancy_edges=None):
     probabilities = jnp.array(config.goal_probabilities, dtype=jnp.float32)
     probabilities = probabilities / jnp.sum(probabilities)
 
-    def relabel(transitions, key):
+    def relabel(transitions: dict[str, jax.Array], key: jax.Array) -> dict[str, jax.Array]:
+        """Relabels one window of transitions with hindsight goals and hitting times.
+
+        Args:
+            transitions: J consecutive transitions of one environment, with keys "observation",
+                "action", "discount", "truncation", "seed" (episode id) and "cost".
+            key: PRNG key for goal sampling.
+
+        Returns:
+            Batch of T = J - (m - 1) samples with keys "observation" (state + first goal),
+            "goal" (m goals), "action" (action chunk), "valid", "is_event" (goal reached within
+            the window), "tau" (hitting time), "censor" (censoring time), "terminates" and,
+            with occupancy edges, "occupancy" / "occupancy_mask" of shape (T, nr_bins).
+        """
+        # Rows t are the T samples (anchors), columns j the J transitions of the window
         J = transitions["observation"].shape[0]
         T = J - (m - 1)
         j = jnp.arange(J)
@@ -40,14 +77,20 @@ def make_relabel_fn(config, env, occupancy_edges=None):
         same_episode = seed[:T, None] == seed[None, :]
         dt = j[None, :] - t[:, None]
 
-        # Goals are sequences of m consecutive achieved goals from one episode, a single goal for m = 1
+        # Goals are sequences of m consecutive achieved goals from one episode,
+        # a single goal for m = 1
         sequence_start = j < T
         for i in range(1, m):
             sequence_start &= jnp.concatenate([seed[:-i] == seed[i:], jnp.zeros((i,), dtype=bool)])
-        sequences = lambda starts: achieved[starts[:, None] + jnp.arange(m)[None, :]].reshape(
-            len(starts), m * goal_size
-        )
 
+        def sequences(starts: jax.Array) -> jax.Array:
+            """Flattened goal sequences starting at `starts`, shape (len(starts), m * goal_size)."""
+            return achieved[starts[:, None] + jnp.arange(m)[None, :]].reshape(
+                len(starts), m * goal_size
+            )
+
+        # Goal strategies: 0 = future goal of the same episode (geometric in dt),
+        # 1 = the currently achieved goal, 2 = a random achieved goal from the window
         key_strategy, key_future, key_random = jax.random.split(key, 3)
         future = same_episode & (dt >= 1) & sequence_start[None, :]
         future_index = jax.random.categorical(
@@ -68,8 +111,11 @@ def make_relabel_fn(config, env, occupancy_edges=None):
         )
         point_goal = goal[:, :goal_size]
 
-        # Goal-reaching time tau: first step at which the whole goal sequence is matched, 0 if already matched
-        # With per-step costs, time runs on the shaped clock C_{t+1} = C_t + 1 + cost_weight * cost_t
+        # Goal-reaching time tau: first step at which the whole goal sequence is matched,
+        # 0 if already matched
+        # With per-step costs, time runs on the shaped clock
+        # C_{t+1} = C_t + 1 + cost_weight * cost_t
+        # match[t, s]: the goal of sample t is matched by the achieved sequence starting at s
         candidates = sequences(t).reshape(T, m, goal_size)
         match = jnp.all(
             jnp.linalg.norm(goal.reshape(T, m, goal_size)[:, None] - candidates[None], axis=-1)
@@ -77,7 +123,7 @@ def make_relabel_fn(config, env, occupancy_edges=None):
             axis=-1,
         )
         future_match = match & same_episode[:, :T] & (dt[:, :T] >= 1)
-        big = jnp.iinfo(jnp.int32).max
+        big = jnp.iinfo(jnp.int32).max  # Sentinel for "not reached"
         if cost_weight > 0.0:
             clock = 1.0 + cost_weight * jnp.maximum(transitions["cost"], 0.0)
             shaped_time = jnp.cumsum(clock) - clock
@@ -101,7 +147,8 @@ def make_relabel_fn(config, env, occupancy_edges=None):
             T, -1
         )
 
-        # Episode ends: the done transition has discount 0, its truncation flag is stored on the next transition
+        # Episode ends: the done transition has discount 0,
+        # its truncation flag is stored on the next transition
         done = transitions["discount"] < 0.5
         next_truncation = transitions["truncation"][jnp.clip(j + 1, 0, J - 1)]
         termination = done & (next_truncation < 0.5) & (j + 1 < J)
@@ -123,7 +170,8 @@ def make_relabel_fn(config, env, occupancy_edges=None):
         }
 
         if occupancy_edges is not None:
-            # Occupancy of the nested goal regions t steps later, zero after a termination, unobserved after a truncation
+            # Occupancy of the nested goal regions t steps later, zero after a termination,
+            # unobserved after a truncation
             ended = jnp.any(same_episode & done[None, :], axis=1)
             last = jnp.where(
                 ended,
@@ -132,6 +180,8 @@ def make_relabel_fn(config, env, occupancy_edges=None):
             )
             alive_future = same_episode & (j[None, :] <= last[:, None]) & (dt >= 1)
             distance = jnp.linalg.norm(point_goal[:, None, :] - achieved[None, :, :], axis=-1)
+            # Soft hit in [0, 1]: fraction of the nested balls (radius * 0.5**i) containing the
+            # achieved goal
             inside = (
                 sum(
                     (distance <= radius * 0.5**i).astype(jnp.float32)
@@ -149,6 +199,7 @@ def make_relabel_fn(config, env, occupancy_edges=None):
             observed = (alive_future | after_termination).astype(jnp.float32)
             edges = jnp.asarray(occupancy_edges)
             nr_bins = len(occupancy_edges) - 1
+            # Sum hits and observations of each sample over the time offsets in each bin
             if cost_weight > 0.0:
                 bins = jnp.searchsorted(
                     edges,
@@ -163,6 +214,7 @@ def make_relabel_fn(config, env, occupancy_edges=None):
                     jnp.einsum("tj,tjk->tk", observed, assign),
                 )
             else:
+                # Re-index columns from the absolute index t + j to the offset j
                 offset_index = t[:, None] + j[None, :]
                 in_window = (offset_index < J).astype(jnp.float32)
                 offset_index = jnp.clip(offset_index, 0, J - 1)

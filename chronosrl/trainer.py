@@ -1,6 +1,11 @@
+"""Off-policy training loop: data collection, replay, actor/critic/entropy updates, evaluation."""
+
+from __future__ import annotations
+
 import os
 import pickle
 import time
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
@@ -13,9 +18,36 @@ from chronosrl.networks import Policy
 from chronosrl.relabeling import make_relabel_fn
 from chronosrl.replay_buffer import ReplayBuffer
 
+if TYPE_CHECKING:
+    from ml_collections import config_dict
+
+    # Carry of the training scan: (policy_state, critic_state, alpha_state, env_state,
+    # buffer_state, key). The env state type depends on the environment.
+    TrainingCarry = tuple[TrainState, TrainState, TrainState, Any, dict[str, jax.Array], jax.Array]
+
 
 class Trainer:
-    def __init__(self, config, algorithm_class, train_env, eval_env, run_path):
+    """Trains a policy that outputs action chunks against a pluggable critic algorithm."""
+
+    def __init__(
+        self,
+        config: config_dict.ConfigDict,
+        algorithm_class: type,
+        train_env: Any,
+        eval_env: Any,
+        run_path: str,
+    ) -> None:
+        """Build the networks, optimizers, replay buffer and relabeling function.
+
+        Args:
+            config: Full config with `runner`, `algorithm` and `environment` sections.
+            algorithm_class: Algorithm (e.g. SRL, CRL), built as
+                `algorithm_class(config.algorithm, train_env)`; provides the critic, its loss
+                and the actor's value estimate.
+            train_env: Batched training environment.
+            eval_env: Batched evaluation environment.
+            run_path: Directory where the model checkpoint is saved.
+        """
         self.train_env = train_env
         self.eval_env = eval_env
         self.run_path = run_path
@@ -53,6 +85,7 @@ class Trainer:
         self.key, policy_key, critic_key = jax.random.split(self.key, 3)
 
         self.algorithm = algorithm_class(config.algorithm, train_env)
+        # The policy outputs a whole action chunk, flattened.
         self.policy = Policy(
             self.action_size * self.action_chunk_length,
             config.algorithm.width,
@@ -95,6 +128,7 @@ class Trainer:
             config.algorithm.window,
             self.nr_windows,
         )
+        # Relabels each sampled window independently (vmapped over windows).
         self.relabel = jax.vmap(
             make_relabel_fn(config.algorithm, train_env, self.algorithm.occupancy_edges)
         )
@@ -102,13 +136,33 @@ class Trainer:
         if self.save_model:
             os.makedirs(self.run_path, exist_ok=True)
 
-    def act(self, policy_params, env_state, chunk, chunk_index, key):
+    def act(
+        self,
+        policy_params: Any,
+        env_state: Any,
+        chunk: jax.Array,
+        chunk_index: jax.Array,
+        key: jax.Array | None,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Return each env's next action, drawing a new action chunk when one is needed.
+
+        Args:
+            policy_params: Policy network parameters.
+            env_state: Batched environment state.
+            chunk: Current action chunks, shape (nr_envs, action_chunk_length, action_size).
+            chunk_index: Index of the next action within each chunk, shape (nr_envs,).
+            key: PRNG key for a stochastic policy, or None to use the mean action.
+
+        Returns:
+            The actions (nr_envs, action_size), the updated chunks and the next chunk indices.
+        """
         mean, log_std = self.policy.apply(
             policy_params, self.train_env.policy_observation(env_state.obs)
         )
         new_chunk = jnp.tanh(
             mean if key is None else mean + jnp.exp(log_std) * jax.random.normal(key, mean.shape)
         )
+        # Start a fresh chunk at episode starts and after a done (autoreset).
         chunk_index = jnp.where(
             (env_state.info["steps"] == 0) | (env_state.done > 0), 0, chunk_index
         )
@@ -119,8 +173,12 @@ class Trainer:
             (chunk_index + 1) % self.action_chunk_length,
         )
 
-    def evaluate(self, policy_params, key):
-        def step(carry, _):
+    def evaluate(self, policy_params: Any, key: jax.Array) -> dict[str, jax.Array]:
+        """Run one episode per eval env with the mean policy and return the eval metrics."""
+
+        def step(
+            carry: tuple[Any, jax.Array, jax.Array], _
+        ) -> tuple[tuple[Any, jax.Array, jax.Array], None]:
             env_state, chunk, chunk_index = carry
             action, chunk, chunk_index = self.act(
                 policy_params, env_state, chunk, chunk_index, None
@@ -136,14 +194,27 @@ class Trainer:
         return self.eval_env.evaluation_metrics(env_state)
 
     def train(self):
-        def collect(policy_params, env_state, key):
-            def step(carry, _):
+        """Prefill the replay buffer, then alternate evaluation and training epochs."""
+        # Structure: each jitted training_epoch scans training_step; each training_step
+        # collects unroll_length steps per env, inserts them into the buffer, samples
+        # minibatches and scans `update` over them.
+
+        def collect(
+            policy_params: Any, env_state: Any, key: jax.Array
+        ) -> tuple[Any, dict[str, jax.Array]]:
+            """Step the train envs; transitions are shaped (unroll_length, nr_envs, ...)."""
+
+            def step(
+                carry: tuple[Any, jax.Array, jax.Array, jax.Array], _
+            ) -> tuple[tuple[Any, jax.Array, jax.Array, jax.Array], dict[str, jax.Array]]:
                 env_state, chunk, chunk_index, key = carry
                 key, subkey = jax.random.split(key)
                 action, chunk, chunk_index = self.act(
                     policy_params, env_state, chunk, chunk_index, subkey
                 )
                 next_env_state = self.train_env.step(env_state, action)
+                # Truncation is read from the pre-step state, so an episode's truncation
+                # flag lands on the transition after its done one (see relabeling).
                 transition = {
                     "observation": env_state.obs,
                     "action": action,
@@ -161,13 +232,18 @@ class Trainer:
             )
             return env_state, transitions
 
-        def sample_batches(buffer_state, key):
+        def sample_batches(
+            buffer_state: dict[str, jax.Array], key: jax.Array
+        ) -> dict[str, jax.Array]:
+            """Sample relabeled minibatches shaped (nr_batches, batch_size, ...)."""
             sample_key, relabel_key, permutation_key, selection_key = jax.random.split(key, 4)
             windows = self.replay_buffer.sample(buffer_state, sample_key)
             batches = self.relabel(windows, jax.random.split(relabel_key, self.nr_windows))
+            # Merge the window axis into the sample axis: (nr_windows * T, ...).
             batches = jax.tree_util.tree_map(lambda x: x.reshape((-1,) + x.shape[2:]), batches)
             nr_samples = batches["valid"].shape[0]
             nr_batches = nr_samples // self.batch_size
+            # Shuffle, dropping the samples that do not fill a full batch.
             permutation = jax.random.permutation(permutation_key, nr_samples)[
                 : nr_batches * self.batch_size
             ]
@@ -180,7 +256,10 @@ class Trainer:
                 batches = jax.tree_util.tree_map(lambda x: x[selection], batches)
             return batches
 
-        def update(carry, batch):
+        def update(
+            carry: tuple[TrainState, TrainState, TrainState, jax.Array], batch: dict[str, jax.Array]
+        ) -> tuple[tuple[TrainState, TrainState, TrainState, jax.Array], dict[str, jax.Array]]:
+            """One gradient step on the critic, then the policy, then the entropy coefficient."""
             policy_state, critic_state, alpha_state, key = carry
             key, actor_key = jax.random.split(key)
 
@@ -193,16 +272,18 @@ class Trainer:
             # Policy
             observation = batch["observation"]
             state = observation[:, : self.state_dim]
+            # The commanded goal, repeated for every step of the critic's goal sequence.
             goal = jnp.tile(observation[:, self.state_dim :], (1, self.goal_sequence_length))
             alpha = jnp.exp(alpha_state.params["log_alpha"])
 
-            def policy_loss_fn(policy_params):
+            def policy_loss_fn(policy_params: Any) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
                 mean, log_std = self.policy.apply(
                     policy_params, self.train_env.policy_observation(observation)
                 )
                 std = jnp.exp(log_std)
                 x = mean + std * jax.random.normal(actor_key, mean.shape)
                 action = jnp.tanh(x)
+                # Gaussian log-prob with the tanh change-of-variables correction.
                 log_prob = jnp.sum(
                     jax.scipy.stats.norm.logpdf(x, loc=mean, scale=std)
                     - jnp.log(1.0 - action**2 + 1e-6),
@@ -217,10 +298,12 @@ class Trainer:
             policy_state = policy_state.apply_gradients(grads=policy_gradients)
 
             # Entropy coefficient
-            alpha_loss_fn = lambda params: jnp.mean(
-                jnp.exp(params["log_alpha"])
-                * jax.lax.stop_gradient(-log_prob - self.target_entropy)
-            )
+            def alpha_loss_fn(params: dict[str, jax.Array]) -> jax.Array:
+                return jnp.mean(
+                    jnp.exp(params["log_alpha"])
+                    * jax.lax.stop_gradient(-log_prob - self.target_entropy)
+                )
+
             alpha_gradients = jax.grad(alpha_loss_fn)(alpha_state.params)
             alpha_state = alpha_state.apply_gradients(grads=alpha_gradients)
 
@@ -235,7 +318,8 @@ class Trainer:
             }
             return (policy_state, critic_state, alpha_state, key), metrics
 
-        def training_step(carry, _):
+        def training_step(carry: TrainingCarry, _) -> tuple[TrainingCarry, dict[str, jax.Array]]:
+            """Collect one unroll, insert it into the buffer and train on sampled batches."""
             policy_state, critic_state, alpha_state, env_state, buffer_state, key = carry
             key, collect_key, sample_key, update_key = jax.random.split(key, 4)
             env_state, transitions = collect(policy_state.params, env_state, collect_key)
@@ -247,15 +331,22 @@ class Trainer:
             return (policy_state, critic_state, alpha_state, env_state, buffer_state, key), metrics
 
         @jax.jit
-        def training_epoch(carry):
+        def training_epoch(carry: TrainingCarry) -> tuple[TrainingCarry, dict[str, jax.Array]]:
+            """Run nr_training_steps_per_epoch training steps; metrics are averaged."""
             carry, metrics = jax.lax.scan(
                 training_step, carry, None, length=self.nr_training_steps_per_epoch
             )
             return carry, jax.tree_util.tree_map(jnp.mean, metrics)
 
         @jax.jit
-        def prefill(policy_params, env_state, buffer_state, key):
-            def step(carry, _):
+        def prefill(
+            policy_params: Any, env_state: Any, buffer_state: dict[str, jax.Array], key: jax.Array
+        ) -> tuple[Any, dict[str, jax.Array]]:
+            """Fill the buffer with nr_prefill_steps unrolls of the initial policy."""
+
+            def step(
+                carry: tuple[Any, dict[str, jax.Array], jax.Array], _
+            ) -> tuple[tuple[Any, dict[str, jax.Array], jax.Array], None]:
                 env_state, buffer_state, key = carry
                 key, subkey = jax.random.split(key)
                 env_state, transitions = collect(policy_params, env_state, subkey)
@@ -280,9 +371,11 @@ class Trainer:
             buffer_state,
             train_key,
         )
+        # From here on the env and buffer state only live in `carry`.
         del env_state, buffer_state
         env_steps = self.nr_prefill_steps * self.env_steps_per_training_step
 
+        # Evaluate before every epoch and once more after the last one.
         for epoch in range(self.nr_epochs + 1):
             eval_key, subkey = jax.random.split(eval_key)
             self.log(
@@ -320,7 +413,8 @@ class Trainer:
                         f,
                     )
 
-    def log(self, metrics, step):
+    def log(self, metrics: dict[str, float | jax.Array], step: int):
+        """Print metrics to stdout and, if enabled, log them to wandb."""
         print(
             f"step {step:>11} | "
             + " | ".join(f"{name} {value:.4g}" for name, value in sorted(metrics.items())),

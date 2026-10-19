@@ -1,13 +1,18 @@
-import numpy as np
+"""SRL: survival RL, a critic modelling the goal hitting time with discrete-time hazards."""
+
+from typing import Any
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 from ml_collections import config_dict
 
 from chronosrl.networks import SurvivalCritic
 from chronosrl.relabeling import bin_discounts
 
 
-def get_config(algorithm_name):
+def get_config(algorithm_name: str) -> config_dict.ConfigDict:
+    """Default SRL hyperparameters."""
     config = config_dict.ConfigDict()
 
     config.name = algorithm_name
@@ -36,37 +41,94 @@ def get_config(algorithm_name):
     return config
 
 
-def hazard_nll(logit0, logits, is_event, tau, censor):
+def hazard_nll(
+    logit0: jax.Array, logits: jax.Array, is_event: jax.Array, tau: jax.Array, censor: jax.Array
+) -> jax.Array:
+    """Negative log-likelihood of (possibly censored) hitting times under the hazard model.
+
+    Args:
+        logit0: (B,) logits of the goal being reached at t = 0.
+        logits: (B, W) hazard logits, h_k = P(goal reached at step k | not reached before).
+        is_event: (B,) 1.0 if the goal was reached at `tau`, 0.0 if the sample is censored.
+        tau: (B,) hitting time.
+        censor: (B,) number of steps observed without reaching the goal.
+
+    Returns:
+        (B,) per-sample negative log-likelihood.
+    """
+    # log1mh_prefix[:, k] = sum_{i <= k} log(1 - h_i), log1mh_before[:, k] = sum_{i < k} ...
     log1mh_prefix = jnp.cumsum(jax.nn.log_sigmoid(-logits), axis=-1)
-    log1mh_before = jnp.concatenate([jnp.zeros_like(log1mh_prefix[:, :1]), log1mh_prefix[:, :-1]], axis=-1)
+    log1mh_before = jnp.concatenate(
+        [jnp.zeros_like(log1mh_prefix[:, :1]), log1mh_prefix[:, :-1]], axis=-1
+    )
     rows = jnp.arange(logits.shape[0])
     k = jnp.clip(tau, 0, logits.shape[1] - 1)
-    ll_event = jnp.where(tau == 0, jax.nn.log_sigmoid(logit0), jax.nn.log_sigmoid(-logit0) + log1mh_before[rows, k] + jax.nn.log_sigmoid(logits)[rows, k])
-    ll_censor = jax.nn.log_sigmoid(-logit0) + jnp.where(censor == 0, 0.0, log1mh_prefix[rows, jnp.clip(censor, 1, logits.shape[1]) - 1])
+    # Event: reached at t = 0, or not at t = 0, survived the steps before tau and hit at tau
+    ll_event = jnp.where(
+        tau == 0,
+        jax.nn.log_sigmoid(logit0),
+        jax.nn.log_sigmoid(-logit0) + log1mh_before[rows, k] + jax.nn.log_sigmoid(logits)[rows, k],
+    )
+    # Censored: not reached at t = 0 and survived the first `censor` steps
+    ll_censor = jax.nn.log_sigmoid(-logit0) + jnp.where(
+        censor == 0, 0.0, log1mh_prefix[rows, jnp.clip(censor, 1, logits.shape[1]) - 1]
+    )
     return -jnp.where(is_event > 0.5, ll_event, ll_censor)
 
 
-def hazard_value(logit0, logits, discounts):
+def hazard_value(logit0: jax.Array, logits: jax.Array, discounts: jax.Array) -> jax.Array:
+    """Negative expected discounted time-to-goal, `-sum_k discounts[k] * S_k`, shape (B,).
+
+    S_k is the probability that the goal has not been reached before step k, so this is the
+    value of a -1 reward per step until the goal is reached.
+    """
     log1mh_prefix = jnp.cumsum(jax.nn.log_sigmoid(-logits), axis=-1)
-    log1mh_before = jnp.concatenate([jnp.zeros_like(log1mh_prefix[:, :1]), log1mh_prefix[:, :-1]], axis=-1)
-    return -jnp.sum(jnp.exp(jax.nn.log_sigmoid(-logit0)[:, None] + log1mh_before) * discounts[None, :], axis=-1)
+    log1mh_before = jnp.concatenate(
+        [jnp.zeros_like(log1mh_prefix[:, :1]), log1mh_prefix[:, :-1]], axis=-1
+    )
+    # Survival probability before step k: (1 - p0) * prod_{i < k} (1 - h_i)
+    return -jnp.sum(
+        jnp.exp(jax.nn.log_sigmoid(-logit0)[:, None] + log1mh_before) * discounts[None, :], axis=-1
+    )
 
 
 class SRL:
-    def __init__(self, config, env):
+    """Survival RL: hazard critic trained by maximum likelihood on relabeled hitting times."""
+
+    def __init__(self, config: config_dict.ConfigDict, env: Any) -> None:
+        """Builds the survival critic and the per-step discounts."""
         self.state_dim = env.state_dim
-        self.critic = SurvivalCritic(config.window, config.width, config.depth, config.depth // 2, config.embedding_dim, True, config.goal_constant_input)
+        self.critic = SurvivalCritic(
+            config.window,
+            config.width,
+            config.depth,
+            config.depth // 2,
+            config.embedding_dim,
+            True,
+            config.goal_constant_input,
+        )
         self.discounts = bin_discounts(np.arange(config.window + 1), config.gamma)
         self.occupancy_edges = None
 
-
-    def critic_loss(self, params, batch):
-        logit0, logits, _, _ = self.critic.apply(params, batch["observation"][:, :self.state_dim], batch["action"], batch["goal"])
+    def critic_loss(
+        self, params: Any, batch: dict[str, jax.Array]
+    ) -> tuple[jax.Array, dict[str, jax.Array]]:
+        """Hazard NLL averaged over valid samples; returns the loss and logging metrics."""
+        logit0, logits, _, _ = self.critic.apply(
+            params, batch["observation"][:, : self.state_dim], batch["action"], batch["goal"]
+        )
         nll = hazard_nll(logit0, logits, batch["is_event"], batch["tau"], batch["censor"])
         loss = jnp.sum(batch["valid"] * nll) / jnp.maximum(jnp.sum(batch["valid"]), 1.0)
         return loss, {"loss/hazard_loss": loss}
 
-
-    def actor_value(self, params, state, action, goal, batch):
+    def actor_value(
+        self,
+        params: Any,
+        state: jax.Array,
+        action: jax.Array,
+        goal: jax.Array,
+        batch: dict[str, jax.Array],
+    ) -> jax.Array:
+        """Q-value for the actor: negative expected discounted time-to-goal (`batch` unused)."""
         logit0, logits, _, _ = self.critic.apply(params, state, action, goal)
         return hazard_value(logit0, logits, self.discounts)
