@@ -23,12 +23,24 @@ def get_runner_config() -> config_dict.ConfigDict:
 
     config.project_name = "chronosrl"
     config.exp_name = "default"
-    config.run_name = f"{int(time.time())}"
+    config.run_name = ""  # Empty: built at launch by `default_run_name`
+    config.tag = ""  # Optional suffix of the default run name, e.g. "depth8"
     config.track_wandb = True
     config.wandb_entity = "rducristian-technical-university-of-munich"
     config.save_model = True
 
     return config
+
+
+def default_run_name(config: config_dict.ConfigDict) -> str:
+    """Return e.g. `20261019-153012_chronosrl_s1000_depth8`: time, algorithm, seed and tag.
+
+    The launch time comes first so that run directories sort chronologically.
+    """
+    parts = [time.strftime("%Y%m%d-%H%M%S"), config.algorithm.name, f"s{config.environment.seed}"]
+    if config.runner.tag:
+        parts.append(config.runner.tag)
+    return "_".join(parts)
 
 
 def load_experiment_config(
@@ -101,6 +113,9 @@ class Runner:
         config.runner = self.runner_config_flag.value
         config.algorithm = self.algorithm_config_flag.value
         config.environment = self.environment_config_flag.value
+        # Built after flag parsing, so CLI overrides of algorithm and seed are included
+        if not config.runner.run_name:
+            config.runner.run_name = default_run_name(config)
         print(config, flush=True)
 
         run_path = os.path.abspath(

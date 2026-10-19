@@ -375,7 +375,8 @@ class Trainer:
         del env_state, buffer_state
         env_steps = self.nr_prefill_steps * self.env_steps_per_training_step
 
-        # Evaluate before every epoch and once more after the last one.
+        # Evaluate before every epoch and once more after the last one. `epoch` counts the
+        # completed epochs, so an epoch's train line and the eval after it share the number.
         for epoch in range(self.nr_epochs + 1):
             eval_key, subkey = jax.random.split(eval_key)
             self.log(
@@ -384,6 +385,7 @@ class Trainer:
                     for name, value in evaluate(carry[0].params, subkey).items()
                 },
                 env_steps,
+                epoch,
             )
             if epoch == self.nr_epochs:
                 break
@@ -399,7 +401,7 @@ class Trainer:
                 * self.env_steps_per_training_step
                 / (time.time() - start_time)
             )
-            self.log(metrics, env_steps)
+            self.log(metrics, env_steps, epoch + 1)
             if self.save_model:
                 with open(os.path.join(self.run_path, "model.pkl"), "wb") as f:
                     pickle.dump(
@@ -413,12 +415,12 @@ class Trainer:
                         f,
                     )
 
-    def log(self, metrics: dict[str, float | jax.Array], step: int):
+    def log(self, metrics: dict[str, float | jax.Array], step: int, epoch: int):
         """Print metrics to stdout and, if enabled, log them to wandb."""
         print(
-            f"step {step:>11} | "
+            f"epoch {epoch:>4}/{self.nr_epochs} | step {step:>11} | "
             + " | ".join(f"{name} {value:.4g}" for name, value in sorted(metrics.items())),
             flush=True,
         )
         if self.track_wandb:
-            wandb.log({"global_step": step, **metrics})
+            wandb.log({"global_step": step, "epoch": epoch, **metrics})
