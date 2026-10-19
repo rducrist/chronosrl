@@ -19,6 +19,7 @@ name = "chronosrl"
 # embedding_layer_norm = true
 
 [environment]
+name = "crazyflow_position"
 seed = 1000
 nr_envs = 512
 nr_eval_envs = 100

@@ -1,0 +1,40 @@
+# Go2 position task (MuJoCo Warp) with the settings of the ChronoSRL paper.
+# Algorithm defaults live in chronosrl/algorithms/<name>.py; this file only overrides them.
+# Run with XLA_FLAGS=--xla_gpu_enable_command_buffer= to avoid rare CUDA graph capture crashes.
+# Write floats with a decimal point: ConfigDict locks the type from the first value.
+
+[runner]
+exp_name = "go2_position"
+
+# Applied to every algorithm
+[algorithm]
+name = "chronosrl"
+total_timesteps = 500_000_000
+unroll_length = 4
+batch_size = 8192
+nr_windows = 192
+goal_constant_input = true
+
+[algorithm.chronosrl]
+goal_sequence_length = 8
+cost_weight = 10.0
+
+[algorithm.srl]
+goal_sequence_length = 8
+cost_weight = 10.0
+
+[algorithm.crl]
+embedding_layer_norm = true
+
+[algorithm.accrl]
+embedding_layer_norm = true
+
+[environment]
+name = "go2_position"
+seed = 1000
+nr_envs = 4096
+nr_eval_envs = 4096
+episode_length = 1000
+gait_amplitude = 0.3
+gait_frequency = 3.0
+travel_cost_weight = 0.3

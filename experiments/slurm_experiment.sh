@@ -11,8 +11,8 @@
 #SBATCH --array=1000-1003
 
 python experiment.py \
+    --config=../configs/ant_u4_maze.toml \
     --algorithm.name=chronosrl \
     --algorithm.depth=8 \
-    --environment.name=ant_u4_maze \
     --environment.seed=$SLURM_ARRAY_TASK_ID \
     --runner.exp_name=ant_u4_maze_depth_8

@@ -12,7 +12,7 @@ from ml_collections import config_dict, config_flags
 
 import wandb
 from chronosrl.algorithms import ALGORITHMS
-from chronosrl.config import default_config_path, load_toml
+from chronosrl.config import load_toml
 from chronosrl.environments import get_environment
 from chronosrl.trainer import Trainer
 
@@ -32,52 +32,49 @@ def get_runner_config() -> config_dict.ConfigDict:
 
 
 def load_experiment_config(
-    path: str | Path, algorithm_name: str
+    experiment: dict[str, Any], algorithm_name: str
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
-    """Read a TOML experiment file into (runner, algorithm, environment) override dicts."""
-    config = load_toml(path)
-
+    """Split a loaded TOML experiment into (runner, algorithm, environment) override dicts."""
     # [algorithm] applies to every algorithm, [algorithm.<name>] only to that one
-    algorithm = config.get("algorithm", {})
+    algorithm = experiment.get("algorithm", {})
     algorithm_overrides = {key: value for key, value in algorithm.items() if key not in ALGORITHMS}
     algorithm_overrides.update(algorithm.get(algorithm_name, {}))
 
-    return config.get("runner", {}), algorithm_overrides, config["environment"]
+    return experiment.get("runner", {}), algorithm_overrides, experiment["environment"]
 
 
 class Runner:
     """Builds the configs as absl config flags and launches training."""
 
     def __init__(self) -> None:
-        """Resolve algorithm, environment and config file, then define the config flags."""
+        """Load the experiment TOML, build the default configs it names, then define the flags."""
         # These are read from sys.argv before absl parses the flags, since they decide
         # which default configs the flags are built from.
-        algorithm_name = self.pop_argument("algorithm.name", "srl")
-        environment_name = self.pop_argument("environment.name", "crazyflow_position")
         config_path = self.pop_argument("config", None)
         if config_path is None:
-            config_path = default_config_path(environment_name)
-        elif not Path(config_path).exists():
+            raise ValueError("Pass the experiment file with --config=configs/<experiment>.toml")
+        if not Path(config_path).exists():
             raise FileNotFoundError(f"Config file not found: {config_path}")
+        experiment = load_toml(config_path)
+
+        # The CLI wins over the TOML, so one experiment file can run several algorithms
+        algorithm_name = (
+            self.pop_argument("algorithm.name", None) or experiment["algorithm"]["name"]
+        )
+        environment_name = experiment["environment"]["name"]
         get_algorithm_config, self.algorithm_class = ALGORITHMS[algorithm_name]
         self.environment = get_environment(environment_name)
 
         runner_config = get_runner_config()
         algorithm_config = get_algorithm_config(algorithm_name)
-        if Path(config_path).exists():
-            runner_overrides, algorithm_overrides, environment_config = load_experiment_config(
-                config_path, algorithm_name
-            )
-            runner_config.update(runner_overrides)
-            algorithm_config.update(algorithm_overrides)
-            environment_config = config_dict.ConfigDict(environment_config)
-            environment_config.name = environment_name
-        else:
-            # Environments without a TOML file keep their Python config
-            algorithm_config.update(
-                self.environment.algorithm_overrides(algorithm_name, environment_name)
-            )
-            environment_config = self.environment.get_config(environment_name)
+        runner_overrides, algorithm_overrides, environment_config = load_experiment_config(
+            experiment, algorithm_name
+        )
+        runner_config.update(runner_overrides)
+        algorithm_config.update(algorithm_overrides)
+        # Keep the logged name equal to the algorithm that actually trains
+        algorithm_config.name = algorithm_name
+        environment_config = config_dict.ConfigDict(environment_config)
 
         self.runner_config_flag = config_flags.DEFINE_config_dict("runner", runner_config)
         self.algorithm_config_flag = config_flags.DEFINE_config_dict("algorithm", algorithm_config)

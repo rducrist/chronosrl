@@ -1,5 +1,4 @@
 import jax.numpy as jnp
-from ml_collections import config_dict
 from mujoco import mjx
 from brax import envs
 
@@ -29,24 +28,7 @@ class EvalWrapper(envs.training.EvalWrapper):
         return {"time_at_goal": jnp.mean(success), "goal_reached": jnp.mean(success > 0), "episode_length": jnp.mean(metrics.episode_steps)}
 
 
-def get_config(environment_name):
-    config = config_dict.ConfigDict()
-
-    config.name = environment_name
-    config.seed = 1000
-    config.nr_envs = 512
-    config.nr_eval_envs = 100
-    config.episode_length = 1000
-
-    return config
-
-
-def algorithm_overrides(algorithm_name, environment_name):
-    if algorithm_name in ("chronosrl", "srl") and environment_name.startswith("humanoid"):
-        return {"goal_sequence_length": 32, "batch_size": 1024}
-    return {}
-
-
+# Hyperparameters live in configs/<environment_name>.toml
 def create_env(config):
     train_env = envs.training.wrap(TASKS[config.environment.name](), episode_length=config.environment.episode_length)
     eval_env = EvalWrapper(envs.training.wrap(TASKS[config.environment.name](), episode_length=config.environment.episode_length))

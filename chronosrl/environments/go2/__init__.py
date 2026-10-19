@@ -1,5 +1,4 @@
 import jax.numpy as jnp
-from ml_collections import config_dict
 
 from chronosrl.environments.go2.goal_environment import Go2GoalEnv
 
@@ -40,28 +39,7 @@ class EvalWrapper:
         return metrics
 
 
-def get_config(environment_name):
-    config = config_dict.ConfigDict()
-
-    config.name = environment_name
-    config.seed = 1000
-    config.nr_envs = 4096
-    config.nr_eval_envs = 4096
-    config.episode_length = 1000
-    config.gait_amplitude = 0.3
-    config.gait_frequency = 3.0
-    config.travel_cost_weight = 0.3 if environment_name == "go2_position" else 0.0
-
-    return config
-
-
-def algorithm_overrides(algorithm_name, environment_name):
-    overrides = {"total_timesteps": 500_000_000, "unroll_length": 4, "batch_size": 8192, "nr_windows": 192, "goal_constant_input": True}
-    if algorithm_name in ("chronosrl", "srl"):
-        overrides.update({"goal_sequence_length": 8, "cost_weight": 10.0})
-    else:
-        overrides["embedding_layer_norm"] = True
-    return overrides
+# Hyperparameters live in configs/<environment_name>.toml
 
 
 def create_env(config):

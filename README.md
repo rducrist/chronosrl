@@ -31,21 +31,22 @@ pip install "jax[cuda12]==0.7.2"
 
 ## Experiments
 ```
-cd experiments
-python experiment.py --algorithm.name=chronosrl --environment.name=ant_u4_maze --algorithm.depth=8 --environment.seed=1000
-XLA_FLAGS=--xla_gpu_enable_command_buffer= python experiment.py --algorithm.name=chronosrl --environment.name=go2_velocity --algorithm.depth=8 --environment.seed=1000
+python experiments/experiment.py --config=configs/ant_u4_maze.toml --algorithm.depth=8 --environment.seed=1000
+XLA_FLAGS=--xla_gpu_enable_command_buffer= python experiments/experiment.py --config=configs/go2_velocity.toml --algorithm.name=srl --algorithm.depth=8 --environment.seed=1000
 ```
-- `--algorithm.name`: `chronosrl`, `crl`, `accrl` or `srl`
-- `--environment.name`:
+- `--config`: the experiment file in `configs/`, one per task, which also picks the algorithm:
     - JaxGCRL: `ant_u4_maze`, `ant_big_maze`, `ant_hardest_maze`, `ant_u5_maze`, `humanoid`, `humanoid_u_maze` or `humanoid_big_maze`
     - Go2: `go2_velocity`, `go2_position` or `go2_box`
+    - Crazyflow: `crazyflow_position`
+- `--algorithm.name`: `chronosrl`, `crl`, `accrl` or `srl`, overrides the one in the config file
 - `--algorithm.depth`: network depth, 1 to 64 in the paper
 - `--environment.seed`: 1000 to 1003 in the paper
 
 The Go2 runs disable XLA's command buffers as in the paper, which avoids rare crashes of MuJoCo Warp's CUDA graph capture.
 
-The defaults are the settings of the paper for every method and task, including the goal sequences and larger batches of ChronoSRL and SRL on the humanoid tasks and the training regime of the Go2 tasks.
-All settings can be changed in the same way, e.g. `--algorithm.total_timesteps=50000000`.
+Algorithm defaults live in `chronosrl/algorithms/<name>.py`, and each config file only overrides them.
+The config files hold the settings of the paper for every method and task, including the goal sequences and larger batches of ChronoSRL and SRL on the humanoid tasks and the training regime of the Go2 tasks.
+All settings can be changed from the command line, e.g. `--algorithm.total_timesteps=50000000`.
 
 The evaluation metrics are printed before every epoch and after the last one.
 `eval/time_at_goal` is the Time at Goal of the paper, velocity tracking adds `eval/forward_time_at_goal` and `eval/forward_tracking_error` for the forward command, and box climbing logs the box height of the training curriculum as `train/box_height` after every epoch.

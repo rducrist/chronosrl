@@ -1,0 +1,16 @@
+# JaxGCRL ant_u5_maze with the settings of the ChronoSRL paper.
+# Algorithm defaults live in chronosrl/algorithms/<name>.py; this file only overrides them.
+# CLI flags still win, e.g. --algorithm.name=srl --algorithm.depth=8 --environment.seed=1001
+
+[runner]
+exp_name = "ant_u5_maze"
+
+[algorithm]
+name = "chronosrl"
+
+[environment]
+name = "ant_u5_maze"
+seed = 1000
+nr_envs = 512
+nr_eval_envs = 100
+episode_length = 1000
