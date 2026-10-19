@@ -1,6 +1,7 @@
 import jax.numpy as jnp
 from ml_collections import config_dict
 
+from chronosrl.config import default_config_path, load_toml
 from chronosrl.environments.crazyflow.drone_reach_pos_env import (
     CrazyflowPositionEnv,
     State,
@@ -56,33 +57,12 @@ class EvalWrapper:
 
 
 def get_config(environment_name):
-    if environment_name != "crazyflow_position":
-        raise ValueError(f"Unknown Crazyflow environment: {environment_name}")
-
-    config = config_dict.ConfigDict()
+    # Hyperparameters live in configs/<environment_name>.toml
+    config = config_dict.ConfigDict(
+        load_toml(default_config_path(environment_name))["environment"]
+    )
     config.name = environment_name
-    config.seed = 1000
-
-    # Small batches while developing the environment.
-    config.nr_envs = 512
-    config.nr_eval_envs = 100
-
-    # 250 policy steps at 50 Hz = 5-second episodes.
-    config.episode_length = 250
-    config.freq = 50
-    config.sim_freq = 500
-
-    config.device = "gpu"
-    config.drone = "cf21B_500"
-    config.dynamics = "first_principles"
-    config.reset_rotor = True
-    config.goal_radius = 0.05
-
     return config
-
-
-def algorithm_overrides(algorithm_name, environment_name):
-    return {"action_chunk_length": 1, "cost_weight": 0.0, "goal_sequence_length": 32}
 
 
 def create_env(config):

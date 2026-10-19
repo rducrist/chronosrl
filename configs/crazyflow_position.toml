@@ -1,0 +1,52 @@
+# Everything specific to the crazyflow_position experiment.
+# Algorithm defaults live in chronosrl/algorithms/<name>.py; this file only overrides them.
+# CLI flags still win, e.g. --environment.spawn.max_speed=0.5
+# Write floats with a decimal point: ConfigDict locks the type from the first value.
+
+
+[runner]
+exp_name = "crazyflow_position"
+
+# Applied to every algorithm
+[algorithm]
+action_chunk_length = 1
+cost_weight = 0.0
+goal_sequence_length = 32
+name = "chronosrl"
+
+# Per-algorithm overrides go in subtables, applied only for that --algorithm.name
+# [algorithm.crl]
+# embedding_layer_norm = true
+
+[environment]
+seed = 1000
+nr_envs = 512
+nr_eval_envs = 100
+episode_length = 250 # 250 policy steps at 50 Hz = 5-second episodes
+freq = 50
+sim_freq = 500
+device = "gpu"
+drone = "cf21B_500"
+dynamics = "first_principles"
+reset_rotor = true
+
+[environment.action]
+max_angle = 1.5707963 # rad, limit for roll/pitch/yaw commands
+
+[environment.task]
+goal_radius = 0.05
+rest_speed = 0.05
+
+# Episodes terminate when the drone leaves this box
+[environment.bounds]
+low = [-4.0, -4.0, 0.0]
+high = [4.0, 4.0, 4.0]
+
+[environment.spawn]
+low = [-1.0, -1.0, 0.5]
+high = [1.0, 1.0, 1.5]
+max_speed = 1.0
+
+[environment.goal]
+low = [-1.0, -1.0, 0.5]
+high = [1.0, 1.0, 1.5]

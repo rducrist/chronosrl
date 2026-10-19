@@ -1,10 +1,14 @@
-"""Roll out a saved JaxGCRL policy and export an interactive Brax viewer."""
+"""Roll out saved policies: Crazyflow native viewer or JaxGCRL HTML playback.
+python -m chronosrl.rollout --run runs/chronosrl/crazyflow_position
+
+"""
 import argparse
 import json
 import os
 from pathlib import Path
 import pickle
 import sys
+import time
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
@@ -12,10 +16,82 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import yaml
-from brax.io import html
 
 from chronosrl.environments import get_environment
 from chronosrl.networks import Policy
+
+
+def rollout_crazyflow(args, run, config, checkpoint):
+    import mujoco
+    from ml_collections import config_dict
+    from chronosrl.environments.crazyflow import CrazyflowPositionEnv
+
+    env_config = config_dict.ConfigDict(config["environment"])
+    env_config.device = args.device
+    env = CrazyflowPositionEnv(env_config, nr_envs=1)
+    dt = 1.0 / env_config.freq
+    algorithm = config["algorithm"]
+    chunk_length = algorithm["action_chunk_length"]
+    policy = Policy(env.action_size * chunk_length, algorithm["width"], algorithm["depth"])
+    params = checkpoint["policy"]
+    reset, step = jax.jit(env.reset), jax.jit(env.step)
+    act = jax.jit(lambda obs: jnp.tanh(policy.apply(params, env.policy_observation(obs))[0]))
+    print(f"Rolling out {run.name} (crazyflow_position), seed {args.seed}, device {args.device}", flush=True)
+    state = reset(jax.random.split(jax.random.PRNGKey(args.seed), 1))
+    # Each frame is the sim data plus the goal the drone is chasing.
+    frames = [(state.data, np.asarray(state.goal[0]))]
+    successes, errors = [], []
+    ended = False
+    for index in range(args.steps):
+        if index % chunk_length == 0:
+            chunk = act(state.obs).reshape(1, chunk_length, env.action_size)
+        state = step(state, chunk[:, index % chunk_length])
+        successes.append(float(state.metrics["success"][0]))
+        errors.append(float(state.metrics["goal_error"][0]))
+        if bool(state.done[0]):
+            # Same-step autoreset returns a different episode: omit that frame.
+            ended = True
+            break
+        frames.append((state.data, np.asarray(state.goal[0])))
+    output = args.output or run / f"rollout_seed{args.seed}.json"
+    if output.suffix != ".json":
+        raise ValueError("Crazyflow --output must be a .json metrics file; playback uses its native viewer")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    metrics = {"run": str(run), "environment": "crazyflow_position", "seed": args.seed,
+               "steps": len(successes), "time_at_goal": float(np.sum(successes)),
+               "goal_reached": bool(np.any(successes)), "goal_error": float(np.mean(errors)),
+               "episode_ended": ended}
+    output.write_text(json.dumps(metrics, indent=2) + "\n")
+    print(json.dumps(metrics, indent=2), flush=True)
+    print(f"Metrics: {output.resolve()}", flush=True)
+    if args.no_render:
+        env.sim.close()
+        return
+    print("Opening Crazyflow's native MuJoCo viewer (red marker = target).", flush=True)
+    try:
+        import glfw
+        frame_count = int(np.ceil((len(frames) - 1) * dt * args.fps)) + 1
+        while True:
+            started = time.perf_counter()
+            for index in range(frame_count):
+                viewer = env.sim.viewer
+                if viewer is not None:
+                    window = viewer.viewer.window
+                    if window is None or glfw.window_should_close(window):
+                        return
+                data, goal = frames[min(int(index / (args.fps * dt)), len(frames) - 1)]
+                env.sim.data = data
+                if viewer is not None:
+                    # The viewer clears markers after every render, so re-add the goal each frame.
+                    viewer.viewer.add_marker(type=mujoco.mjtGeom.mjGEOM_SPHERE, pos=goal,
+                                             size=np.full(3, env.goal_radius),
+                                             rgba=np.array([1.0, 0.0, 0.0, 0.5]), label="")
+                env.sim.render(world=0)
+                time.sleep(max(0.0, started + (index + 1) / args.fps - time.perf_counter()))
+            if not args.loop:
+                break
+    finally:
+        env.sim.close()
 
 
 def main():
@@ -26,6 +102,9 @@ def main():
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--fps", type=float, default=60, help="Playback frames per second")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--device", choices=("cpu", "gpu"), default="cpu", help="Crazyflow rollout device")
+    parser.add_argument("--no-render", action="store_true", help="Crazyflow: compute metrics without opening a window")
+    parser.add_argument("--loop", action="store_true", help="Crazyflow: repeat playback until the window is closed")
     parser.add_argument("--source-repo", type=Path,
                         default=Path(__file__).resolve().parents[2] / "survival-reinforcement-learning",
                         help="Original SRL repository (needed for args.pkl checkpoints)")
@@ -70,12 +149,18 @@ def main():
     name = args.environment or config["environment"]["name"]
     if name.startswith("go2"):
         parser.error("This viewer currently supports JaxGCRL environments only")
-    # Apply the project's Brax/MuJoCo compatibility setup for both checkpoint formats.
-    environment_module = get_environment(name)
     algorithm = config["algorithm"]
     chunk_length = algorithm["action_chunk_length"]
     with (run / "model.pkl").open("rb") as file:
         checkpoint = pickle.load(file)
+    if name.startswith("crazyflow_"):
+        if name != "crazyflow_position" or original_config is not None:
+            parser.error("Crazyflow playback requires a native crazyflow_position checkpoint")
+        rollout_crazyflow(args, run, config, checkpoint)
+        return
+    from brax.io import html
+    # Apply the project's Brax/MuJoCo compatibility setup for benchmark checkpoints.
+    environment_module = get_environment(name)
     if original_config is not None:
         source_repo = args.source_repo.resolve()
         if not (source_repo / "srl/utils/actors.py").exists():

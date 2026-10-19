@@ -1,12 +1,15 @@
+import json
 import os
 import sys
 import time
+from pathlib import Path
 
 from absl import app
 from ml_collections import config_dict, config_flags
 
 import wandb
 from chronosrl.algorithms import ALGORITHMS
+from chronosrl.config import default_config_path, load_toml
 from chronosrl.environments import get_environment
 from chronosrl.trainer import Trainer
 
@@ -17,31 +20,63 @@ def get_runner_config():
     config.project_name = "chronosrl"
     config.exp_name = "default"
     config.run_name = f"{int(time.time())}"
-    config.track_wandb = False
-    config.wandb_entity = ""
-    config.save_model = False
+    config.track_wandb = True
+    config.wandb_entity = "rducristian-technical-university-of-munich"
+    config.save_model = True
 
     return config
+
+
+def load_experiment_config(path, algorithm_name):
+    config = load_toml(path)
+
+    # [algorithm] applies to every algorithm, [algorithm.<name>] only to that one
+    algorithm = config.get("algorithm", {})
+    algorithm_overrides = {
+        key: value for key, value in algorithm.items() if key not in ALGORITHMS
+    }
+    algorithm_overrides.update(algorithm.get(algorithm_name, {}))
+
+    return config.get("runner", {}), algorithm_overrides, config["environment"]
 
 
 class Runner:
     def __init__(self):
         algorithm_name = self.pop_argument("algorithm.name", "srl")
         environment_name = self.pop_argument("environment.name", "crazyflow_position")
+        config_path = self.pop_argument("config", None)
+        if config_path is None:
+            config_path = default_config_path(environment_name)
+        elif not Path(config_path).exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
         get_algorithm_config, self.algorithm_class = ALGORITHMS[algorithm_name]
         self.environment = get_environment(environment_name)
+
+        runner_config = get_runner_config()
         algorithm_config = get_algorithm_config(algorithm_name)
-        algorithm_config.update(
-            self.environment.algorithm_overrides(algorithm_name, environment_name)
-        )
+        if Path(config_path).exists():
+            runner_overrides, algorithm_overrides, environment_config = (
+                load_experiment_config(config_path, algorithm_name)
+            )
+            runner_config.update(runner_overrides)
+            algorithm_config.update(algorithm_overrides)
+            environment_config = config_dict.ConfigDict(environment_config)
+            environment_config.name = environment_name
+        else:
+            # Environments without a TOML file keep their Python config
+            algorithm_config.update(
+                self.environment.algorithm_overrides(algorithm_name, environment_name)
+            )
+            environment_config = self.environment.get_config(environment_name)
+
         self.runner_config_flag = config_flags.DEFINE_config_dict(
-            "runner", get_runner_config()
+            "runner", runner_config
         )
         self.algorithm_config_flag = config_flags.DEFINE_config_dict(
             "algorithm", algorithm_config
         )
         self.environment_config_flag = config_flags.DEFINE_config_dict(
-            "environment", self.environment.get_config(environment_name)
+            "environment", environment_config
         )
 
     @staticmethod
@@ -74,6 +109,11 @@ class Runner:
                 config=config.to_dict(),
             )
             wandb.define_metric("*", step_metric="global_step")
+        if config.runner.save_model:
+            # Resolved config (TOML + CLI), read back by rollout.py
+            os.makedirs(run_path, exist_ok=True)
+            with open(os.path.join(run_path, "config.json"), "w") as file:
+                json.dump(config.to_dict(), file, indent=2)
 
         train_env, eval_env = self.environment.create_env(config)
         Trainer(config, self.algorithm_class, train_env, eval_env, run_path).train()

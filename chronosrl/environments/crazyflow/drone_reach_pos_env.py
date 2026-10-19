@@ -24,9 +24,11 @@ class CrazyflowPositionEnv:
     state_dim, observation_size, action_size, goal_indices = 13, 16, 4, (0, 3)
 
     def __init__(self, config, nr_envs):
+        assert config.sim_freq % config.freq == 0, "sim_freq must be a multiple of freq"
         self.nr_envs = nr_envs
         self.episode_length = config.episode_length
-        self.goal_radius = config.goal_radius
+        self.goal_radius = config.task.goal_radius
+        self.rest_speed = config.task.rest_speed
         self.n_substeps = config.sim_freq // config.freq
 
         self.sim = Sim(
@@ -42,24 +44,29 @@ class CrazyflowPositionEnv:
         # Attitude commands: roll, pitch, yaw in radians, then collective thrust in newtons
         params = load_params(config.dynamics, config.drone)
         thrust_min, thrust_max = 4 * params["thrust_min"], 4 * params["thrust_max"]
-        self.action_low = jnp.array([-jnp.pi / 2, -jnp.pi / 2, -jnp.pi / 2, thrust_min])
-        self.action_high = jnp.array([jnp.pi / 2, jnp.pi / 2, jnp.pi / 2, thrust_max])
+        max_angle = config.action.max_angle
+        self.action_low = jnp.array([-max_angle, -max_angle, -max_angle, thrust_min])
+        self.action_high = jnp.array([max_angle, max_angle, max_angle, thrust_max])
 
         # Episodes terminate when the drone leaves this box
-        self.bounds_low, self.bounds_high = (
-            jnp.array([-4.0, -4.0, 0.0]),
-            jnp.array([4.0, 4.0, 4.0]),
-        )
+        self.bounds_low = jnp.array(config.bounds.low)
+        self.bounds_high = jnp.array(config.bounds.high)
 
-        self.spawn_low, self.spawn_high = (
-            jnp.array([-1.0, -1.0, 0.5]),
-            jnp.array([1.0, 1.0, 1.5]),
-        )
-        self.goal_low, self.goal_high = (
-            jnp.array([-1.0, -1.0, 0.5]),
-            jnp.array([1.0, 1.0, 1.5]),
-        )
-        self.max_spawn_speed = 1.0
+        self.spawn_low = jnp.array(config.spawn.low)
+        self.spawn_high = jnp.array(config.spawn.high)
+        self.goal_low = jnp.array(config.goal.low)
+        self.goal_high = jnp.array(config.goal.high)
+        self.max_spawn_speed = config.spawn.max_speed
+
+        # Spawn with rotors already at hover 
+        self.reset_rotor = config.reset_rotor
+        hover_thrust = params["mass"] * jnp.linalg.norm(params["gravity_vec"]) / 4
+        self.hover_rotor_vel = float(hover_thrust)
+        # TODO there has to be a more elegant way 
+        # Solve k2 * rpm^2 + k1 * rpm + k0 = hover_thrust
+        k0, k1, k2 = params["rpm2thrust"]
+        hover_rpm = (-k1 + jnp.sqrt(k1**2 - 4 * k2 * (k0 - hover_thrust))) / (2 * k2)
+        self.hover_rotor_vel = float(hover_rpm)
 
     def policy_observation(self, obs):
         # Replace the absolute position of the drone with the relative position to the goal
@@ -97,7 +104,10 @@ class CrazyflowPositionEnv:
         )
 
         data = self.sim._reset(data, self.sim.default_data, mask)
-        data = data.replace(states=leaf_replace(data.states, mask, pos=pos, vel=vel))
+        spawn_state = {"pos": pos, "vel": vel}
+        if self.reset_rotor:
+            spawn_state["rotor_vel"] = jnp.full((self.nr_envs, 1, 4), self.hover_rotor_vel)
+        data = data.replace(states=leaf_replace(data.states, mask, **spawn_state))
 
         goal = new_goal if mask is None else jnp.where(mask[:, None], new_goal, goal)
 
@@ -175,7 +185,7 @@ class CrazyflowPositionEnv:
         distance = jnp.linalg.norm(goal - pos, axis=-1)
         speed = jnp.linalg.norm(vel, axis=-1)
         at_goal = distance < self.goal_radius
-        at_rest = speed < 0.05
+        at_rest = speed < self.rest_speed
 
         return {
             "success": at_goal.astype(jnp.float32),

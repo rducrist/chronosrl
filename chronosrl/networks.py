@@ -4,7 +4,9 @@ from jax.nn.initializers import variance_scaling, zeros, normal
 
 
 def dense(features):
-    return nn.Dense(features, kernel_init=variance_scaling(1 / 3, "fan_in", "uniform"), bias_init=zeros)
+    return nn.Dense(
+        features, kernel_init=variance_scaling(1 / 3, "fan_in", "uniform"), bias_init=zeros
+    )
 
 
 def dense_norm_act(x, width):
@@ -64,7 +66,9 @@ class HazardHead(nn.Module):
     @nn.compact
     def __call__(self, z_sa, z_g):
         film = dense(2 * self.embedding_dim)(z_g)
-        z = (1.0 + 0.1 * film[..., :self.embedding_dim]) * z_sa + 0.1 * film[..., self.embedding_dim:]
+        z = (1.0 + 0.1 * film[..., : self.embedding_dim]) * z_sa + 0.1 * film[
+            ..., self.embedding_dim :
+        ]
         h = dense_norm_act(jnp.concatenate([z, z_g, z - z_g, z * z_g], axis=-1), self.width)
         for _ in range(self.depth // 4):
             h = ResidualBlock(self.width)(h)
@@ -89,9 +93,19 @@ class SurvivalCritic(nn.Module):
 
     @nn.compact
     def __call__(self, state, action, goal):
-        z_sa = Encoder(self.width, self.encoder_depth, self.embedding_dim, self.layer_norm)(jnp.concatenate([state, action], axis=-1))
-        z_g = Encoder(self.width, self.encoder_depth, self.embedding_dim, self.layer_norm, self.goal_constant_input)(goal)
-        return HazardHead(self.nr_bins, self.width, self.depth, self.embedding_dim, self.nr_occupancy_bins)(z_sa, z_g) + (z_sa, z_g)
+        z_sa = Encoder(self.width, self.encoder_depth, self.embedding_dim, self.layer_norm)(
+            jnp.concatenate([state, action], axis=-1)
+        )
+        z_g = Encoder(
+            self.width,
+            self.encoder_depth,
+            self.embedding_dim,
+            self.layer_norm,
+            self.goal_constant_input,
+        )(goal)
+        return HazardHead(
+            self.nr_bins, self.width, self.depth, self.embedding_dim, self.nr_occupancy_bins
+        )(z_sa, z_g) + (z_sa, z_g)
 
 
 class ContrastiveCritic(nn.Module):
@@ -103,8 +117,12 @@ class ContrastiveCritic(nn.Module):
 
     @nn.compact
     def __call__(self, state, action, goal):
-        z_sa = Encoder(self.width, self.depth, self.embedding_dim, self.layer_norm)(jnp.concatenate([state, action], axis=-1))
-        z_g = Encoder(self.width, self.depth, self.embedding_dim, self.layer_norm, self.goal_constant_input)(goal)
+        z_sa = Encoder(self.width, self.depth, self.embedding_dim, self.layer_norm)(
+            jnp.concatenate([state, action], axis=-1)
+        )
+        z_g = Encoder(
+            self.width, self.depth, self.embedding_dim, self.layer_norm, self.goal_constant_input
+        )(goal)
         return z_sa, z_g
 
 
