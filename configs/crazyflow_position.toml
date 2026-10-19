@@ -6,13 +6,15 @@
 
 [runner]
 exp_name = "crazyflow_position"
+checkpoint_every = 20 # keep checkpoints/epoch_<N>.pkl every N epochs (0: only the latest model.pkl)
 
 # Applied to every algorithm
 [algorithm]
 action_chunk_length = 1
 cost_weight = 0.0
 goal_sequence_length = 32
-name = "chronosrl"
+name = "srl"
+window = 1000
 
 # Per-algorithm overrides go in subtables, applied only for that --algorithm.name
 # [algorithm.crl]
@@ -23,7 +25,7 @@ name = "crazyflow_position"
 seed = 1000
 nr_envs = 512
 nr_eval_envs = 100
-episode_length = 250 # 250 policy steps at 50 Hz = 5-second episodes
+episode_length = 1000 # 1000 policy steps at 50 Hz = 20-second episodes
 freq = 50
 sim_freq = 500
 device = "gpu"

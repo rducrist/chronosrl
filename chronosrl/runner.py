@@ -28,6 +28,8 @@ def get_runner_config() -> config_dict.ConfigDict:
     config.track_wandb = True
     config.wandb_entity = "rducristian-technical-university-of-munich"
     config.save_model = True
+    # Keep checkpoints/epoch_<N>.pkl every N epochs and after the last one; 0: only model.pkl
+    config.checkpoint_every = 1
 
     return config
 

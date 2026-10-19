@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import shutil
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -52,6 +53,7 @@ class Trainer:
         self.eval_env = eval_env
         self.run_path = run_path
         self.save_model = config.runner.save_model
+        self.checkpoint_every = config.runner.checkpoint_every
         self.track_wandb = config.runner.track_wandb
         self.seed = config.environment.seed
         self.nr_envs = config.environment.nr_envs
@@ -403,7 +405,10 @@ class Trainer:
             )
             self.log(metrics, env_steps, epoch + 1)
             if self.save_model:
-                with open(os.path.join(self.run_path, "model.pkl"), "wb") as f:
+                # model.pkl always holds the latest epoch; every `checkpoint_every` epochs
+                # (and after the last one) it is also kept as checkpoints/epoch_<N>.pkl
+                model_path = os.path.join(self.run_path, "model.pkl")
+                with open(model_path, "wb") as f:
                     pickle.dump(
                         jax.device_get(
                             {
@@ -413,6 +418,15 @@ class Trainer:
                             }
                         ),
                         f,
+                    )
+                completed = epoch + 1
+                if self.checkpoint_every > 0 and (
+                    completed % self.checkpoint_every == 0 or completed == self.nr_epochs
+                ):
+                    checkpoint_dir = os.path.join(self.run_path, "checkpoints")
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+                    shutil.copyfile(
+                        model_path, os.path.join(checkpoint_dir, f"epoch_{completed:03d}.pkl")
                     )
 
     def log(self, metrics: dict[str, float | jax.Array], step: int, epoch: int):

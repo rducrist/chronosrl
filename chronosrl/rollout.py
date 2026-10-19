@@ -71,7 +71,7 @@ def rollout_crazyflow(
             ended = True
             break
         frames.append((state.data, np.asarray(state.goal[0])))
-    output = args.output or run / f"rollout_seed{args.seed}.json"
+    output = args.output or run / f"rollout{epoch_suffix(args)}_seed{args.seed}.json"
     if output.suffix != ".json":
         raise ValueError(
             "Crazyflow --output must be a .json metrics file; playback uses its native viewer"
@@ -125,11 +125,19 @@ def rollout_crazyflow(
         env.sim.close()
 
 
+def epoch_suffix(args: argparse.Namespace) -> str:
+    """Return `_epoch<N>` when a specific epoch is rolled out, so outputs don't overwrite."""
+    return "" if args.epoch is None else f"_epoch{args.epoch:03d}"
+
+
 def main():
     """Parse arguments, load the run's config and checkpoint, and roll out the policy."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run", type=Path, default=Path("runs/srl/default"))
     parser.add_argument("--environment", help="Override the saved environment name")
+    parser.add_argument(
+        "--epoch", type=int, help="Load checkpoints/epoch_<N>.pkl instead of the latest model.pkl"
+    )
     parser.add_argument("--seed", type=int, default=1000)
     parser.add_argument("--steps", type=int, default=1000)
     parser.add_argument("--fps", type=float, default=60, help="Playback frames per second")
@@ -205,7 +213,12 @@ def main():
         parser.error("This viewer currently supports JaxGCRL environments only")
     algorithm = config["algorithm"]
     chunk_length = algorithm["action_chunk_length"]
-    with (run / "model.pkl").open("rb") as file:
+    checkpoint_path = run / "model.pkl"
+    if args.epoch is not None:
+        checkpoint_path = run / "checkpoints" / f"epoch_{args.epoch:03d}.pkl"
+        if not checkpoint_path.exists():
+            parser.error(f"No checkpoint for epoch {args.epoch}: {checkpoint_path}")
+    with checkpoint_path.open("rb") as file:
         checkpoint = pickle.load(file)
     if name.startswith("crazyflow_"):
         if name != "crazyflow_position" or original_config is not None:
@@ -263,7 +276,7 @@ def main():
         successes.append(float(state.metrics["success"]))
         if bool(state.done):
             break
-    output = args.output or run / f"rollout_seed{args.seed}.html"
+    output = args.output or run / f"rollout{epoch_suffix(args)}_seed{args.seed}.html"
     output.parent.mkdir(parents=True, exist_ok=True)
     # The viewer uses system.dt as the interval between saved rollout frames.
     viewer_sys = jax.device_get(env.sys).replace(dt=1.0 / args.fps)
