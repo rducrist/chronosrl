@@ -6,9 +6,12 @@ import jax.numpy as jnp
 from crazyflow.dynamics import load_params
 from crazyflow.sim import Sim
 from crazyflow.sim.data import SimData
+from crazyflow.sim.pipeline import append_fn, insert_fn_before, prepend_fn
 from crazyflow.utils import leaf_replace
 from flax import struct
 from ml_collections import config_dict
+
+from chronosrl.environments.crazyflow import domain_randomization as dr
 
 
 @struct.dataclass
@@ -57,6 +60,44 @@ class CrazyflowPositionEnv:
             control="attitude",
             freq=config.sim_freq,
         )
+
+        # Randomization
+        rand = config.randomization
+        if rand.enabled:
+            delay_steps = round(rand.action_delay * config.sim_freq)  # 0.04 s * 500 Hz = 20
+            # Plugins must exist before build_default_data, so resets restore them
+            self.sim.data = dr.add_delay_plugin(self.sim.data, delay_steps)
+            self.sim.data = dr.add_wrench_plugin(self.sim.data)
+
+            append_fn(self.sim.reset_pipeline, dr.build_randomize_mass_fn(rand.mass))
+            append_fn(self.sim.reset_pipeline, dr.build_randomize_inertia_fn(rand.inertia))
+            append_fn(
+                self.sim.reset_pipeline, dr.build_randomize_rotor_dynamics_fn(rand.rotor_dynamics)
+            )
+            append_fn(
+                self.sim.reset_pipeline, dr.build_randomize_thrust_curve_fn(rand.thrust_curve)
+            )
+            append_fn(
+                self.sim.reset_pipeline, dr.build_randomize_torque_curve_fn(rand.torque_curve)
+            )
+            append_fn(
+                self.sim.reset_pipeline, dr.build_randomize_wrench_fn(rand.force, rand.torque)
+            )
+            append_fn(self.sim.reset_pipeline, dr.build_randomize_delay_fn(delay_steps))
+            prepend_fn(
+                self.sim.step_pipeline,
+                dr.build_delay_attitude_fn(self.n_substeps),
+                name="delay",
+            )
+            insert_fn_before(
+                self.sim.step_pipeline,
+                "integration",
+                dr.build_disturb_wrench_fn(rand.force_noise, rand.torque_noise),
+                name="disturb_wrench",
+            )
+            self.sim.build_default_data()
+            self.sim._reset = self.sim.build_reset_fn()
+            self.sim._step = self.sim.build_step_fn()
 
         # Attitude commands: roll, pitch, yaw in radians, then collective thrust in newtons
         params = load_params(config.dynamics, config.drone)

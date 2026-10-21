@@ -33,6 +33,20 @@ drone = "cf21B_500"
 dynamics = "first_principles"
 reset_rotor = true
 
+[environment.randomization]
+enabled = true
+mass = 0.2            # fraction
+inertia = 0.2         # fraction per principal axis
+rotor_dynamics = 0.2  # fraction per motor and coefficient
+thrust_curve = 0.1    # fraction per motor and coefficient
+torque_curve = 0.1    # fraction per motor and coefficient
+force = 0.04          # N per axis, constant per episode (~10 % of hover thrust)
+torque = 0.0002       # Nm per axis, constant per episode
+force_noise = 0.05    # N std per sim step
+torque_noise = 0.001  # Nm std per sim step
+action_delay = 0.04   # s, max lag of the attitude command
+
+
 [environment.action]
 max_angle = 0.5236 # rad, limit for roll/pitch/yaw commands
 
