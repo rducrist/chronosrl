@@ -32,7 +32,7 @@ class CrazyflowPositionEnv:
     the rest is the goal, which lives in the ``goal_indices`` slice of the state (the position).
     """
 
-    state_dim, observation_size, action_size, goal_indices = 13, 16, 4, (0, 3)
+    state_dim, observation_size, action_size, goal_indices = 13, 16, 3, (0, 3)
 
     def __init__(self, config: config_dict.ConfigDict, nr_envs: int):
         """Build the batched simulator and precompute the action, bound and spawn ranges.
@@ -62,8 +62,8 @@ class CrazyflowPositionEnv:
         params = load_params(config.dynamics, config.drone)
         thrust_min, thrust_max = 4 * params["thrust_min"], 4 * params["thrust_max"]
         max_angle = config.action.max_angle
-        self.action_low = jnp.array([-max_angle, -max_angle, -max_angle, thrust_min])
-        self.action_high = jnp.array([max_angle, max_angle, max_angle, thrust_max])
+        self.action_low = jnp.array([-max_angle, -max_angle, thrust_min])
+        self.action_high = jnp.array([max_angle, max_angle, thrust_max])
 
         # Episodes terminate when the drone leaves this box
         self.bounds_low = jnp.array(config.bounds.low)
@@ -177,7 +177,11 @@ class CrazyflowPositionEnv:
         scaled_action = self.action_low + 0.5 * (action + 1.0) * (
             self.action_high - self.action_low
         )
-        data = F.attitude_control(state.data, scaled_action[:, None, :])
+
+        # Drop yaw command
+        yaw = jnp.zeros((self.nr_envs, 1))
+        command = jnp.concatenate([scaled_action[:, :2], yaw, scaled_action[:, 2:]], axis=-1)
+        data = F.attitude_control(state.data, command[:, None, :])
 
         # 2. Advance physics
         data = self.sim._step(data, self.n_substeps)

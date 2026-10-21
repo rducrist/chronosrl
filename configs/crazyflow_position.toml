@@ -34,7 +34,7 @@ dynamics = "first_principles"
 reset_rotor = true
 
 [environment.action]
-max_angle = 1.5707963 # rad, limit for roll/pitch/yaw commands
+max_angle = 0.5236 # rad, limit for roll/pitch/yaw commands
 
 [environment.task]
 goal_radius = 0.05
