@@ -1,0 +1,57 @@
+# Everything specific to the pendulum_swingup toy experiment.
+# Algorithm defaults live in chronosrl/algorithms/<name>.py; this file only overrides them.
+# CLI flags still win, e.g. --environment.goal.low=0.0 --environment.goal.high=0.0
+# Write floats with a decimal point: ConfigDict locks the type from the first value.
+
+
+[runner]
+exp_name = "pendulum_swingup"
+checkpoint_every = 1 # keep every epoch, for comparing critics across the success jump
+
+# Applied to every algorithm
+[algorithm]
+name = "srl"
+# 25 epochs of 24 training steps: (total - min_replay_size * nr_envs) // (nr_epochs * unroll_length * nr_envs)
+total_timesteps = 10_000_000
+nr_epochs = 25
+unroll_length = 62
+
+# Buffer config 
+min_replay_size = 1000
+max_replay_size = 10000
+
+# SGD config 
+batch_size = 512
+nr_sgd_batches = 800
+
+depth = 4
+
+window = 200 # = episode_length, also the number of hazard bins
+goal_sequence_length = 10
+action_chunk_length = 1
+cost_weight = 0.0
+
+
+[environment]
+name = "pendulum_swingup"
+seed = 1000
+nr_envs = 256
+nr_eval_envs = 100
+episode_length = 200 # 200 steps at dt = 0.05 = 10-second episodes
+dt = 0.05
+gravity = 10.0
+mass = 1.0
+pendulum_length = 1.0
+max_torque = 2.0 # below gravity's pull, so reaching the top needs swinging
+max_speed = 8.0
+
+[environment.task]
+goal_radius = 0.1 # chord distance between (cos, sin) points, about +-5.7 degrees
+
+[environment.spawn]
+max_speed = 1.0 # initial |theta_dot|; the initial angle is uniform in [-pi, pi)
+
+# Goal angle range in radians, 0 = upright; low = high = 0.0 for swing-up only
+[environment.goal]
+low = 0.0
+high = 0.0

@@ -10,6 +10,8 @@ def get_environment(environment_name: str) -> ModuleType:
         module = "go2"
     elif environment_name.startswith("crazyflow_"):
         module = "crazyflow"
+    elif environment_name.startswith("pendulum_"):
+        module = "toy_examples"
     else:
         module = "jaxgcrl"
 
