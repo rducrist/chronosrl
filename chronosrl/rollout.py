@@ -1,4 +1,4 @@
-"""Roll out saved policies: Crazyflow native viewer or JaxGCRL HTML playback.
+"""Roll out saved policies: Crazyflow native viewer, pendulum animation or JaxGCRL HTML playback.
 
 python -m chronosrl.rollout --run runs/chronosrl/crazyflow_position
 """
@@ -125,6 +125,110 @@ def rollout_crazyflow(
         env.sim.close()
 
 
+def pendulum_frame(
+    theta: float, goal: float, goal_radius: float, torque: float, step: int, success: bool
+) -> np.ndarray:
+    """Draw one pendulum frame: the goal tolerance wedge, the rod and the applied torque."""
+    from PIL import Image, ImageDraw
+
+    size, length = 400, 150
+    center = np.array([size / 2, size / 2])
+    image = Image.new("RGB", (size, size), "white")
+    draw = ImageDraw.Draw(image)
+
+    def tip(angle: float) -> tuple[float, float]:
+        # theta = 0 is upright; image y points down
+        return tuple(center + length * np.array([np.sin(angle), -np.cos(angle)]))
+
+    # PIL angles run clockwise from 3 o'clock, so upright (theta = 0) is -90 degrees
+    tolerance = np.degrees(2 * np.arcsin(goal_radius / 2))
+    heading = np.degrees(goal) - 90
+    box = [*(center - length - 20), *(center + length + 20)]
+    draw.pieslice(box, heading - tolerance, heading + tolerance, fill=(255, 205, 205))
+    draw.ellipse([*(np.array(tip(goal)) - 8), *(np.array(tip(goal)) + 8)], outline="red", width=3)
+    draw.line([tuple(center), tip(theta)], fill="black", width=8)
+    bob = np.array(tip(theta))
+    draw.ellipse([*(bob - 14), *(bob + 14)], fill="green" if success else "royalblue")
+    draw.ellipse([*(center - 6), *(center + 6)], fill="black")
+    draw.text((10, 10), f"step {step}   torque {torque:+.2f}", fill="black")
+    return np.asarray(image)
+
+
+def rollout_pendulum(
+    args: argparse.Namespace, run: Path, config: dict[str, Any], checkpoint: dict[str, Any]
+) -> None:
+    """Roll out a pendulum checkpoint for one episode and save metrics and a real-time animation.
+
+    Args:
+        args: Parsed command-line arguments of `main`.
+        run: Run directory containing `model.pkl`.
+        config: Saved run config with "environment" and "algorithm" sections.
+        checkpoint: Unpickled `model.pkl`; its "policy" entry holds the policy params.
+    """
+    import imageio.v3 as iio
+    from ml_collections import config_dict
+
+    from chronosrl.environments.toy_examples.pendulum_env import PendulumEnv
+
+    env_config = config_dict.ConfigDict(config["environment"])
+    env = PendulumEnv(env_config, nr_envs=1)
+    algorithm = config["algorithm"]
+    chunk_length = algorithm["action_chunk_length"]
+    policy = Policy(env.action_size * chunk_length, algorithm["width"], algorithm["depth"])
+    params = checkpoint["policy"]
+    reset, step = jax.jit(env.reset), jax.jit(env.step)
+    # Deterministic policy: tanh of the mean, a flat chunk of `chunk_length` actions.
+    act = jax.jit(lambda obs: jnp.tanh(policy.apply(params, env.policy_observation(obs))[0]))
+    print(f"Rolling out {run.name} ({config['environment']['name']}), seed {args.seed}", flush=True)
+    state = reset(jax.random.split(jax.random.PRNGKey(args.seed), 1))
+    frames = []
+    successes, errors = [], []
+    ended = False
+    for index in range(args.steps):
+        if index % chunk_length == 0:
+            chunk = act(state.obs).reshape(1, chunk_length, env.action_size)
+        action = chunk[:, index % chunk_length]
+        frames.append(
+            pendulum_frame(
+                float(state.theta[0]),
+                float(state.goal[0]),
+                env.goal_radius,
+                float(action[0, 0]) * env_config.max_torque,
+                index,
+                bool(state.metrics["success"][0]),
+            )
+        )
+        state = step(state, action)
+        successes.append(float(state.metrics["success"][0]))
+        errors.append(float(state.metrics["goal_error"][0]))
+        if bool(state.done[0]):
+            # Same-step autoreset returns a different episode: stop before drawing it.
+            ended = True
+            break
+    output = args.output or run / f"rollout{epoch_suffix(args)}_seed{args.seed}.gif"
+    if output.suffix not in (".gif", ".mp4"):
+        raise ValueError("Pendulum --output must be a .gif or .mp4 animation")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # One frame per policy step, played back in real time
+    if output.suffix == ".gif":
+        iio.imwrite(output, np.stack(frames), duration=1000 * env_config.dt, loop=0)
+    else:
+        iio.imwrite(output, np.stack(frames), fps=1 / env_config.dt)
+    metrics = {
+        "run": str(run),
+        "environment": config["environment"]["name"],
+        "seed": args.seed,
+        "steps": len(successes),
+        "time_at_goal": float(np.sum(successes)),
+        "goal_reached": bool(np.any(successes)),
+        "goal_error": float(np.mean(errors)),
+        "episode_ended": ended,
+    }
+    output.with_suffix(".json").write_text(json.dumps(metrics, indent=2) + "\n")
+    print(json.dumps(metrics, indent=2), flush=True)
+    print(f"Animation: {output.resolve()}", flush=True)
+
+
 def epoch_suffix(args: argparse.Namespace) -> str:
     """Return `_epoch<N>` when a specific epoch is rolled out, so outputs don't overwrite."""
     return "" if args.epoch is None else f"_epoch{args.epoch:03d}"
@@ -224,6 +328,11 @@ def main():
         if name != "crazyflow_position" or original_config is not None:
             parser.error("Crazyflow playback requires a native crazyflow_position checkpoint")
         rollout_crazyflow(args, run, config, checkpoint)
+        return
+    if name.startswith("pendulum_"):
+        if original_config is not None:
+            parser.error("Pendulum playback requires a native pendulum checkpoint")
+        rollout_pendulum(args, run, config, checkpoint)
         return
     from brax.io import html
 
