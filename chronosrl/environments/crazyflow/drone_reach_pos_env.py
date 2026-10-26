@@ -7,7 +7,7 @@ from crazyflow.dynamics import load_params
 from crazyflow.sim import Sim
 from crazyflow.sim.data import SimData
 from crazyflow.sim.pipeline import append_fn, insert_fn_before, prepend_fn
-from crazyflow.utils import leaf_replace
+from crazyflow.utils import CORE_NDIM_KEY, leaf_replace
 from flax import struct
 from jax.scipy.spatial.transform import Rotation as R
 from ml_collections import config_dict
@@ -20,7 +20,7 @@ class State:
     """Batched state of all ``n`` parallel worlds."""
 
     data: SimData
-    obs: jax.Array  # (n, 16) = [pos, quat, vel, ang_vel, goal]
+    obs: jax.Array  # (n, 24) = [pos, rotation_flattened, vel, ang_vel, last_action, goal]
     goal: jax.Array  # (n,3)
     reward: jax.Array  # (n, )
     key: jax.Array  # single PRNG key, split on every step for autoresets
@@ -29,14 +29,28 @@ class State:
     metrics: dict
 
 
+@struct.dataclass
+class LastAction:
+    """Last policy action in [-1, 1]. The metadata marks it per world, so masked resets zero it."""
+
+    action: jax.Array = struct.field(metadata={CORE_NDIM_KEY: 1})  # (N, M, 3)
+
+
+def add_last_action_plugin(data: SimData, action_size: int) -> SimData:
+    """Add the last action plugin. Call before build_default_data so resets restore it."""
+    shape = (*data.controls.attitude.staged_cmd.shape[:-1], action_size)
+    return data.replace(plugins={**data.plugins, "last_action": LastAction(jnp.zeros(shape))})
+
+
 class CrazyflowPositionEnv:
     """Fly one Crazyflie per world to a random goal position with attitude commands.
 
-    The first ``state_dim`` observation entries are the drone state ``[pos, quat, vel, ang_vel]``,
-    the rest is the goal, which lives in the ``goal_indices`` slice of the state (the position).
+    The first ``state_dim`` observation entries are the drone state
+    ``[pos, rot_mat, vel, ang_vel, last_action]``, the rest is the goal, which lives in the
+    ``goal_indices`` slice of the state (the position).
     """
 
-    state_dim, observation_size, action_size, goal_indices = 13, 16, 3, (0, 3)
+    state_dim, observation_size, action_size, goal_indices = 21, 24, 3, (0, 3)
 
     def __init__(self, config: config_dict.ConfigDict, nr_envs: int):
         """Build the batched simulator and precompute the action, bound and spawn ranges.
@@ -61,6 +75,11 @@ class CrazyflowPositionEnv:
             control="attitude",
             freq=config.sim_freq,
         )
+
+        # Delta actions: the policy outputs a change to the last action
+        self.delta_action = config.action.delta
+        self.max_delta = config.action.max_delta
+        self.sim.data = add_last_action_plugin(self.sim.data, self.action_size)
 
         # Randomization
         rand = config.randomization
@@ -94,11 +113,12 @@ class CrazyflowPositionEnv:
                 dr.build_disturb_wrench_fn(rand.force_noise, rand.torque_noise),
                 name="disturb_wrench",
             )
-            self.sim.build_default_data()
-            self.sim._reset = self.sim.build_reset_fn()
-            self.sim._step = self.sim.build_step_fn()
 
-        # Attitude commands: roll, pitch, yaw in radians, then collective thrust in newtons
+        self.sim.build_default_data()
+        self.sim._reset = self.sim.build_reset_fn()
+        self.sim._step = self.sim.build_step_fn()
+
+        # Actions: roll, pitch in radians, then collective thrust in newtons. Yaw is held at 0
         params = load_params(config.dynamics, config.drone)
         thrust_min, thrust_max = 4 * params["thrust_min"], 4 * params["thrust_max"]
         max_angle = config.action.max_angle
@@ -126,28 +146,39 @@ class CrazyflowPositionEnv:
         self.hover_rotor_vel = float(hover_rpm)
 
     def policy_observation(self, obs: jax.Array) -> jax.Array:
-        """Turn ``(..., 16)`` observations into ``(..., 18)`` policy inputs."""
+        """Turn ``(..., 24)`` observations into ``(..., 21)`` policy inputs."""
         # Replace the absolute position of the drone with the relative position to the goal
-        quat = obs[..., 3:7]
-        # Rotation matrix instead of the quaternion: continuous and no q / -q ambiguity
-        rotation = R.from_quat(quat)
-        rot_mat = rotation.as_matrix().reshape(*obs.shape[:-1], 9)
-
         pos = obs[..., :3]
-        vel = obs[..., 7:10]
+        rot_mat = obs[..., 3:12]
+        vel = obs[..., 12:15]
+        ang_vel = obs[..., 15:18]  # is already in body frame
+        last_action = obs[..., 18 : self.state_dim]
         goal = obs[..., self.state_dim :]
+
+        # rotation = R.from_matrix(rot_mat.reshape(*rot_mat.shape[:-1], 3, 3))
         # pos_to_goal_body = rotation.apply(goal - pos, inverse=True)
         # vel_body = rotation.apply(vel, inverse=True)
-        ang_vel = obs[..., 10 : self.state_dim]  # is already in body frame
 
-        return jnp.concatenate([pos - goal, vel, rot_mat, ang_vel], axis=-1)
+        return jnp.concatenate([pos - goal, vel, rot_mat, ang_vel, last_action], axis=-1)
 
     def observation(self, data: SimData, goal: jax.Array) -> jax.Array:
-        """Build the ``(n, 16)`` observation ``[pos, quat, vel, ang_vel, goal]``."""
+        """Build the ``(n, 24)`` observation ``[pos, rot_mat, vel, ang_vel, last_action, goal]``."""
         states = data.states
-        # TODO : scipy array api env variable to 1, then R.from(quat).as_matrix() or gravity vector
+
+        quat = states.quat
+        # Rotation matrix instead of the quaternion: continuous and no q / -q ambiguity
+        rotation = R.from_quat(quat)
+        rot_mat = rotation.as_matrix().reshape(-1, 9)
+
         return jnp.concatenate(
-            [states.pos[:, 0], states.quat[:, 0], states.vel[:, 0], states.ang_vel[:, 0], goal],
+            [
+                states.pos[:, 0],
+                rot_mat,
+                states.vel[:, 0],
+                states.ang_vel[:, 0],
+                data.plugins["last_action"].action[:, 0],
+                goal,
+            ],
             axis=-1,
         ).astype(jnp.float32)
 
@@ -221,7 +252,8 @@ class CrazyflowPositionEnv:
 
         Args:
             state: Current state.
-            action: ``(n, 4)`` actions in ``[-1, 1]``, rescaled to attitude commands.
+            action: ``(n, 3)`` actions in ``[-1, 1]``, rescaled to attitude commands. With delta
+                actions, a change of up to ``max_delta`` to the last action.
 
         Returns:
             The next state. For worlds that ended, ``obs`` and ``goal`` already belong to the new
@@ -230,15 +262,21 @@ class CrazyflowPositionEnv:
         key, spawn_key = jax.random.split(state.key)
 
         # 1. Scale action and send to attitude control
+        if self.delta_action:
+            last_action = state.data.plugins["last_action"].action[:, 0]
+            action = last_action + self.max_delta * jnp.clip(action, -1.0, 1.0)
         action = jnp.clip(action, -1.0, 1.0)
+        data = state.data.replace(
+            plugins={**state.data.plugins, "last_action": LastAction(action[:, None, :])}
+        )
         scaled_action = self.action_low + 0.5 * (action + 1.0) * (
             self.action_high - self.action_low
         )
 
-        # Drop yaw command
+        # Insert a zero yaw command between pitch and thrust
         yaw = jnp.zeros((self.nr_envs, 1))
         command = jnp.concatenate([scaled_action[:, :2], yaw, scaled_action[:, 2:]], axis=-1)
-        data = F.attitude_control(state.data, command[:, None, :])
+        data = F.attitude_control(data, command[:, None, :])
 
         # 2. Advance physics
         data = self.sim._step(data, self.n_substeps)

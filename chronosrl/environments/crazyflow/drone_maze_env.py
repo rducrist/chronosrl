@@ -4,7 +4,6 @@ import jax
 import jax.numpy as jnp
 from crazyflow.sim.data import SimData
 from crazyflow.utils import leaf_replace
-from jax.scipy.spatial.transform import Rotation as R
 from ml_collections import config_dict
 
 from chronosrl.environments.crazyflow.drone_reach_pos_env import CrazyflowPositionEnv
@@ -119,18 +118,14 @@ class DroneMazeEnv(CrazyflowPositionEnv):
         return data, goal
 
     def policy_observation(self, obs: jax.Array) -> jax.Array:
-        """Turn ``(..., 16)`` observations into ``(..., 21)`` policy inputs."""
-        quat = obs[..., 3:7]
-        # Rotation matrix instead of the quaternion: continuous and no q / -q ambiguity
-        rotation = R.from_quat(quat)
-        rot_mat = rotation.as_matrix().reshape(*obs.shape[:-1], 9)
-
+        """Turn ``(..., 21)`` observations into ``(..., 21)`` policy inputs."""
         pos = obs[..., :3]
-        vel = obs[..., 7:10]
+        rot_mat = obs[..., 3:12]
+        vel = obs[..., 12:15]
         goal = obs[..., self.state_dim :]
         # pos_to_goal_body = rotation.apply(goal - pos, inverse=True)
         # vel_body = rotation.apply(vel, inverse=True)
-        ang_vel = obs[..., 10 : self.state_dim]  # is already in body frame
+        ang_vel = obs[..., 15 : self.state_dim]  # is already in body frame
 
         return jnp.concatenate([pos, self.scaling * (pos - goal), vel, rot_mat, ang_vel], axis=-1)
 
