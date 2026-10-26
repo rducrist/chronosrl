@@ -7,7 +7,14 @@ import jax.numpy as jnp
 from ml_collections import config_dict
 
 from chronosrl.config import default_config_path, load_toml
+from chronosrl.environments.crazyflow.drone_maze_env import DroneMazeEnv
 from chronosrl.environments.crazyflow.drone_reach_pos_env import CrazyflowPositionEnv, State
+
+# Maps [environment].name in the TOML to the env class
+ENVS = {
+    "crazyflow_position": CrazyflowPositionEnv,
+    "crazyflow_maze": DroneMazeEnv,
+}
 
 
 class EvalWrapper:
@@ -60,13 +67,17 @@ class EvalWrapper:
         episode = state.info["episode_metrics"]
         steps = state.info["episode_steps"]
 
-        return {
+        metrics = {
             "time_at_goal": jnp.mean(episode["success"]),
             "goal_reached": jnp.mean(episode["success"] > 0),
             "time_at_goal_rest": jnp.mean(episode["rest_success"]),
             "goal_error": jnp.mean(episode["goal_error"] / jnp.maximum(steps, 1.0)),
             "episode_length": jnp.mean(steps),
         }
+        # Only the maze env reports wall crashes
+        if "crashed" in episode:
+            metrics["crash_rate"] = jnp.mean(episode["crashed"] > 0)
+        return metrics
 
 
 def get_config(environment_name: str) -> config_dict.ConfigDict:
@@ -80,6 +91,7 @@ def get_config(environment_name: str) -> config_dict.ConfigDict:
 def create_env(config: config_dict.ConfigDict) -> tuple[CrazyflowPositionEnv, EvalWrapper]:
     """Build the training env and the evaluation env from the full experiment config."""
     env_config = config.environment
-    train_env = CrazyflowPositionEnv(env_config, env_config.nr_envs)
-    eval_env = EvalWrapper(CrazyflowPositionEnv(env_config, env_config.nr_eval_envs))
+    env_class = ENVS[env_config.name]
+    train_env = env_class(env_config, env_config.nr_envs)
+    eval_env = EvalWrapper(env_class(env_config, env_config.nr_eval_envs))
     return train_env, eval_env

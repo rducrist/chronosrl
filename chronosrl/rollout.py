@@ -26,7 +26,7 @@ from chronosrl.networks import Policy
 def rollout_crazyflow(
     args: argparse.Namespace, run: Path, config: dict[str, Any], checkpoint: dict[str, Any]
 ) -> None:
-    """Roll out a native crazyflow_position checkpoint, save metrics and replay it in MuJoCo.
+    """Roll out a native crazyflow checkpoint, save metrics and replay it in MuJoCo.
 
     Args:
         args: Parsed command-line arguments of `main`.
@@ -37,11 +37,14 @@ def rollout_crazyflow(
     import mujoco
     from ml_collections import config_dict
 
-    from chronosrl.environments.crazyflow import CrazyflowPositionEnv
+    from chronosrl.environments.crazyflow import ENVS
 
     env_config = config_dict.ConfigDict(config["environment"])
     env_config.device = args.device
-    env = CrazyflowPositionEnv(env_config, nr_envs=1)
+    if "maze" in env_config:
+        env_config.maze.random_start = False  # always start in the R cell
+
+    env = ENVS[env_config.name](env_config, nr_envs=1)
     dt = 1.0 / env_config.freq
     algorithm = config["algorithm"]
     chunk_length = algorithm["action_chunk_length"]
@@ -51,7 +54,7 @@ def rollout_crazyflow(
     # Deterministic policy: tanh of the mean, a flat chunk of `chunk_length` actions.
     act = jax.jit(lambda obs: jnp.tanh(policy.apply(params, env.policy_observation(obs))[0]))
     print(
-        f"Rolling out {run.name} (crazyflow_position), seed {args.seed}, device {args.device}",
+        f"Rolling out {run.name} ({env_config.name}), seed {args.seed}, device {args.device}",
         flush=True,
     )
     state = reset(jax.random.split(jax.random.PRNGKey(args.seed), 1))
@@ -79,7 +82,7 @@ def rollout_crazyflow(
     output.parent.mkdir(parents=True, exist_ok=True)
     metrics = {
         "run": str(run),
-        "environment": "crazyflow_position",
+        "environment": env_config.name,
         "seed": args.seed,
         "steps": len(successes),
         "time_at_goal": float(np.sum(successes)),
@@ -94,6 +97,20 @@ def rollout_crazyflow(
         env.sim.close()
         return
     print("Opening Crazyflow's native MuJoCo viewer (red marker = target).", flush=True)
+    # Maze envs: walls exist only as xy cells, drawn as boxes up to the ceiling of the bounds
+    wall_xy = np.asarray(getattr(env, "wall_xy", np.zeros((0, 2))))
+    cam_config = None
+    if len(wall_xy):
+        wall_height = float(env.bounds_high[2])
+        wall_size = np.array([env.scaling / 2, env.scaling / 2, wall_height / 2])
+        # Look down on the maze centre from far enough to see all of it
+        rows, cols = env.walls.shape
+        center = np.array([(rows - 1) * env.scaling / 2, (cols - 1) * env.scaling / 2, 0.0])
+        cam_config = {
+            "lookat": center,
+            "distance": 1.2 * max(rows, cols) * env.scaling,
+            "elevation": -60.0,
+        }
     try:
         import glfw
 
@@ -117,7 +134,15 @@ def rollout_crazyflow(
                         rgba=np.array([1.0, 0.0, 0.0, 0.5]),
                         label="",
                     )
-                env.sim.render(world=0)
+                    for x, y in wall_xy:
+                        viewer.viewer.add_marker(
+                            type=mujoco.mjtGeom.mjGEOM_BOX,
+                            pos=np.array([x, y, wall_size[2]]),
+                            size=wall_size,
+                            rgba=np.array([0.7, 0.5, 0.3, 0.5]),
+                            label="",
+                        )
+                env.sim.render(world=0, cam_config=cam_config)
                 time.sleep(max(0.0, started + (index + 1) / args.fps - time.perf_counter()))
             if not args.loop:
                 break
@@ -325,8 +350,10 @@ def main():
     with checkpoint_path.open("rb") as file:
         checkpoint = pickle.load(file)
     if name.startswith("crazyflow_"):
-        if name != "crazyflow_position" or original_config is not None:
-            parser.error("Crazyflow playback requires a native crazyflow_position checkpoint")
+        from chronosrl.environments.crazyflow import ENVS
+
+        if name not in ENVS or original_config is not None:
+            parser.error(f"Crazyflow playback requires a native checkpoint of one of {list(ENVS)}")
         rollout_crazyflow(args, run, config, checkpoint)
         return
     if name.startswith("pendulum_"):

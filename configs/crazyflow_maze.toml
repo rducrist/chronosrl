@@ -1,0 +1,74 @@
+# Everything specific to the crazyflow_maze experiment.
+# Algorithm defaults live in chronosrl/algorithms/<name>.py; this file only overrides them.
+# CLI flags still win, e.g. --environment.maze.layout=big_maze
+# Write floats with a decimal point: ConfigDict locks the type from the first value.
+
+
+[runner]
+exp_name = "crazyflow_maze"
+checkpoint_every = 5 # keep checkpoints/epoch_<N>.pkl every N epochs (0: only the latest model.pkl)
+tag = "u4_maze-full_dr"
+
+# Applied to every algorithm
+[algorithm]
+action_chunk_length = 1
+cost_weight = 0.0
+goal_sequence_length = 10
+name = "srl"
+window = 1000
+
+[environment]
+name = "crazyflow_maze"
+seed = 1000
+nr_envs = 512
+nr_eval_envs = 100
+episode_length = 1000 # episode_length * 1 / freq  of seconds per episode
+freq = 50
+sim_freq = 500
+device = "gpu"
+drone = "cf21B_500"
+dynamics = "first_principles"
+reset_rotor = true
+
+[environment.maze]
+layout = "u_maze"  # u4_maze, u5_maze, big_maze or hardest_maze
+scaling = 2.0       # m, side of one maze cell
+spawn_noise = 0.7   # m, max xy offset of spawns and goals from a cell centre (< scaling / 2)
+random_start = true # spawn in any free cell instead of only the start cell
+
+[environment.randomization]
+enabled = true
+mass = 0.2            # fraction
+thrust_curve = 0.1    # fraction per motor and coefficient
+action_delay = 0.04   # s, max lag of the attitude command
+inertia = 0.2         # fraction per principal axis
+rotor_dynamics = 0.2  # fraction per motor and coefficient
+torque_curve = 0.1    # fraction per motor and coefficient
+force = 0.04          # N per axis, constant per episode (~10 % of hover thrust)
+torque = 0.0002       # Nm per axis, constant per episode
+force_noise = 0.05    # N std per sim step
+torque_noise = 0.001  # Nm std per sim step
+
+[environment.action]
+max_angle = 0.5236 # rad, limit for roll/pitch commands
+
+[environment.task]
+goal_radius = 0.05
+rest_speed = 0.05
+
+# Episodes terminate when the drone leaves this box or enters a wall cell.
+# Only z matters in practice: the outer walls are hit before the xy bounds.
+[environment.bounds]
+low = [-10.0, -10.0, 0.0]
+high = [60.0, 60.0, 3.0]
+
+# Only z is used: xy comes from the maze cells
+[environment.spawn]
+low = [0.0, 0.0, 0.5]
+high = [0.0, 0.0, 1.5]
+max_speed = 1.0
+
+# Only z is used: xy comes from the maze cells
+[environment.goal]
+low = [0.0, 0.0, 0.5]
+high = [0.0, 0.0, 1.5]
