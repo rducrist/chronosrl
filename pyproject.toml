@@ -78,7 +78,12 @@ chronosrl = { path = ".", editable = true }
 [tool.pixi.environments]
 benchmark = { features = ["benchmark"] }
 go2 = { features = ["go2"] }
-crazyflow = { features = ["crazyflow"] }
+
+[tool.pixi.environments.crazyflow]
+features = ["crazyflow"]
+
+[tool.pixi.environments.crazyflow.dependencies]
+ruff = ">=0.17.1,<0.18"
 
 [tool.pixi.feature.benchmark.dependencies]
 python = "3.10.*"
@@ -121,6 +126,9 @@ python = "3.11.*"
 
 [tool.pixi.feature.go2.pypi-dependencies]
 jax = { version = "==0.7.2", extras = ["cuda12"] }
+
+[tool.pixi.dependencies]
+ipython = ">=8.37.0,<10"
 
 [tool.ruff]
 # Exclude a variety of commonly ignored directories.
