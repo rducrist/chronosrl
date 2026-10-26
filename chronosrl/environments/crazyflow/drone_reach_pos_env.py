@@ -9,6 +9,7 @@ from crazyflow.sim.data import SimData
 from crazyflow.sim.pipeline import append_fn, insert_fn_before, prepend_fn
 from crazyflow.utils import leaf_replace
 from flax import struct
+from jax.scipy.spatial.transform import Rotation as R
 from ml_collections import config_dict
 
 from chronosrl.environments.crazyflow import domain_randomization as dr
@@ -85,9 +86,7 @@ class CrazyflowPositionEnv:
             )
             append_fn(self.sim.reset_pipeline, dr.build_randomize_delay_fn(delay_steps))
             prepend_fn(
-                self.sim.step_pipeline,
-                dr.build_delay_attitude_fn(self.n_substeps),
-                name="delay",
+                self.sim.step_pipeline, dr.build_delay_attitude_fn(self.n_substeps), name="delay"
             )
             insert_fn_before(
                 self.sim.step_pipeline,
@@ -127,15 +126,26 @@ class CrazyflowPositionEnv:
         self.hover_rotor_vel = float(hover_rpm)
 
     def policy_observation(self, obs: jax.Array) -> jax.Array:
-        """Turn ``(..., 16)`` observations into ``(..., 13)`` policy inputs."""
+        """Turn ``(..., 16)`` observations into ``(..., 18)`` policy inputs."""
         # Replace the absolute position of the drone with the relative position to the goal
-        position = obs[..., :3]
+        quat = obs[..., 3:7]
+        # Rotation matrix instead of the quaternion: continuous and no q / -q ambiguity
+        rotation = R.from_quat(quat)
+        rot_mat = rotation.as_matrix().reshape(*obs.shape[:-1], 9)
+
+        pos = obs[..., :3]
+        vel = obs[..., 7:10]
         goal = obs[..., self.state_dim :]
-        return jnp.concatenate([position - goal, obs[..., 3 : self.state_dim]], axis=-1)
+        # pos_to_goal_body = rotation.apply(goal - pos, inverse=True)
+        # vel_body = rotation.apply(vel, inverse=True)
+        ang_vel = obs[..., 10 : self.state_dim]  # is already in body frame
+
+        return jnp.concatenate([pos - goal, vel, rot_mat, ang_vel], axis=-1)
 
     def observation(self, data: SimData, goal: jax.Array) -> jax.Array:
         """Build the ``(n, 16)`` observation ``[pos, quat, vel, ang_vel, goal]``."""
         states = data.states
+        # TODO : scipy array api env variable to 1, then R.from(quat).as_matrix() or gravity vector
         return jnp.concatenate(
             [states.pos[:, 0], states.quat[:, 0], states.vel[:, 0], states.ang_vel[:, 0], goal],
             axis=-1,
@@ -200,6 +210,12 @@ class CrazyflowPositionEnv:
             metrics=self.evaluation_step_metrics(pos, vel, goal),
         )
 
+    def terminated(self, pos: jax.Array, vel: jax.Array) -> jax.Array:
+        """Return the ``(n,)`` worlds whose drone left the bounds box or has a non-finite state."""
+        out_of_bounds = jnp.any((pos < self.bounds_low) | (pos > self.bounds_high), axis=-1)
+        not_finite = ~jnp.all(jnp.isfinite(pos) & jnp.isfinite(vel), axis=-1)
+        return out_of_bounds | not_finite
+
     def step(self, state: State, action: jax.Array) -> State:
         """Advance one policy step and autoreset the worlds whose episode ended.
 
@@ -229,9 +245,7 @@ class CrazyflowPositionEnv:
 
         # 3. Check how episode ended
         pos, vel = data.states.pos[:, 0], data.states.vel[:, 0]
-        out_of_bounds = jnp.any((pos < self.bounds_low) | (pos > self.bounds_high), axis=-1)
-        not_finite = ~jnp.all(jnp.isfinite(pos) & jnp.isfinite(vel), axis=-1)
-        terminated = out_of_bounds | not_finite
+        terminated = self.terminated(pos, vel)
         steps = state.info["steps"] + 1.0
         truncated = (steps >= self.episode_length) & ~terminated
         done = terminated | truncated
