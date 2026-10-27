@@ -23,7 +23,8 @@ import jax.numpy as jnp
 import numpy as np
 from ml_collections import config_dict
 
-from chronosrl.environments.crazyflow import CrazyflowPositionEnv, EvalWrapper, State
+from chronosrl.environments.crazyflow import EvalWrapper, make_env
+from chronosrl.environments.crazyflow.drone_env import State
 from chronosrl.networks import Policy
 
 
@@ -42,7 +43,7 @@ def evaluate(
     env_config: config_dict.ConfigDict, policy: Policy, params: Any, nr_worlds: int, seed: int
 ) -> dict[str, float]:
     """Run one episode in each of ``nr_worlds`` worlds and return the averaged eval metrics."""
-    env = EvalWrapper(CrazyflowPositionEnv(env_config, nr_worlds))
+    env = EvalWrapper(make_env(env_config, nr_worlds))
 
     @jax.jit
     def run(key: jax.Array) -> dict[str, jax.Array]:
@@ -68,7 +69,7 @@ def view(
     import glfw
     import mujoco
 
-    env = CrazyflowPositionEnv(env_config, nr_envs=1)
+    env = make_env(env_config, nr_envs=1)
     reset, step = jax.jit(env.reset), jax.jit(env.step)
     act = jax.jit(lambda obs: jnp.tanh(policy.apply(params, env.policy_observation(obs))[0]))
 
@@ -159,8 +160,11 @@ def main():
         parser.error("Only action_chunk_length = 1 is supported")
     with checkpoint_path.open("rb") as file:
         params = pickle.load(file)["policy"]
-    policy = Policy(CrazyflowPositionEnv.action_size, algorithm["width"], algorithm["depth"])
     env_config = handover_config(args, config["environment"])
+    # The action size depends on the wrappers the config enables
+    env = make_env(env_config, 1)
+    policy = Policy(env.action_size, algorithm["width"], algorithm["depth"])
+    env.sim.close()
 
     print(f"Evaluating {checkpoint_path} from handover {args.handover}", flush=True)
     metrics = evaluate(env_config, policy, params, args.nr_worlds, args.seed)

@@ -6,13 +6,13 @@ from crazyflow.sim.data import SimData
 from crazyflow.utils import leaf_replace
 from ml_collections import config_dict
 
-from chronosrl.environments.crazyflow.drone_reach_pos_env import CrazyflowPositionEnv
+from chronosrl.environments.crazyflow.drone_env import DroneEnv
 from chronosrl.environments.maze_layouts import LAYOUTS
 from chronosrl.environments.maze_layouts import G as GOAL
 from chronosrl.environments.maze_layouts import R as RESET
 
 
-class DroneMazeEnv(CrazyflowPositionEnv):
+class DroneMazeEnv(DroneEnv):
     """Fly one Crazyflie per world through a maze to a goal in a random free cell.
 
     The maze uses the ant maze layouts, with cell ``(i, j)`` centred at ``(i, j) * scaling``.

@@ -3,13 +3,14 @@ import jax.numpy as jnp
 import pytest
 
 from chronosrl.environments.crazyflow import get_config
-from chronosrl.environments.crazyflow.drone_reach_pos_env import CrazyflowPositionEnv
+from chronosrl.environments.crazyflow.drone_env import DroneEnv
 
 
-def make_env(nr_envs: int = 1) -> CrazyflowPositionEnv:
+def make_env(nr_envs: int = 1) -> DroneEnv:
+    # Unwrapped, so the attribute overrides in the tests reach the env
     config = get_config("crazyflow_position")
     config.device = "cpu"
-    return CrazyflowPositionEnv(config, nr_envs)
+    return DroneEnv(config, nr_envs)
 
 
 @pytest.mark.integration
@@ -22,7 +23,7 @@ def test_reset_at_fixed_position():
 
     state = jax.jit(env.reset)(jax.random.split(jax.random.PRNGKey(42), 1))
 
-    # obs = [pos 0:3, quat 3:7, vel 7:10, ang_vel 10:13, goal 13:16]
+    # obs = [pos 0:3, rot_mat 3:12, vel 12:15, ang_vel 15:18, goal 18:21]
     assert jnp.allclose(state.obs[:, 0:3], point)
     assert jnp.allclose(env.policy_observation(state.obs)[:, 0:3], 0.0)
-    assert jnp.allclose(state.obs[:, 7:10], 0.0)
+    assert jnp.allclose(state.obs[:, 12:15], 0.0)

@@ -50,7 +50,8 @@ force_noise = 0.05    # N std per sim step
 torque_noise = 0.001  # Nm std per sim step
 
 [environment.action]
-max_angle = 0.5236 # rad, limit for roll/pitch commands
+max_angle = 0.5236 # rad, limit for roll/pitch/yaw commands
+zero_yaw = true # hold the yaw command at 0, the policy outputs [roll, pitch, thrust]
 delta = false # the policy outputs a change to the last action
 max_delta = 0.1 # max change per policy step, in [-1, 1] action units
 

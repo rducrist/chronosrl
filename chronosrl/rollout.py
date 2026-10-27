@@ -37,14 +37,14 @@ def rollout_crazyflow(
     import mujoco
     from ml_collections import config_dict
 
-    from chronosrl.environments.crazyflow import ENVS
+    from chronosrl.environments.crazyflow import make_env
 
     env_config = config_dict.ConfigDict(config["environment"])
     env_config.device = args.device
     if "maze" in env_config:
         env_config.maze.random_start = False  # always start in the R cell
 
-    env = ENVS[env_config.name](env_config, nr_envs=1)
+    env = make_env(env_config, nr_envs=1)
     dt = 1.0 / env_config.freq
     algorithm = config["algorithm"]
     chunk_length = algorithm["action_chunk_length"]
