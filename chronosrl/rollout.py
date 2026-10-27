@@ -1,6 +1,6 @@
 """Roll out saved policies: Crazyflow native viewer, pendulum animation or JaxGCRL HTML playback.
 
-python -m chronosrl.rollout --run runs/chronosrl/crazyflow_position
+python -m chronosrl.rollout --run runs/crazyflow_position/srl
 """
 
 import argparse

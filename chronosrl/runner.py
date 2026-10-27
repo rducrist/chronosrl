@@ -121,7 +121,7 @@ class Runner:
         print(config, flush=True)
 
         run_path = os.path.abspath(
-            f"runs/{config.runner.project_name}/{config.runner.exp_name}/{config.runner.run_name}"
+            f"runs/{config.environment.name}/{config.algorithm.name}/{config.runner.run_name}"
         )
         if config.runner.track_wandb:
             wandb.init(
