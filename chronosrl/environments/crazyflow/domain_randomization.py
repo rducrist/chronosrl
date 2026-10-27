@@ -14,12 +14,15 @@ from typing import TYPE_CHECKING, Callable, NamedTuple
 import flax.struct as struct
 import jax
 import jax.numpy as jp
+from crazyflow.sim.pipeline import append_fn, insert_fn_before, prepend_fn
 from crazyflow.utils import CORE_NDIM_KEY, leaf_replace
 from jax import Array
 from scipy.spatial.transform import Rotation as R
 
 if TYPE_CHECKING:
+    from crazyflow.sim import Sim
     from crazyflow.sim.data import SimData
+    from ml_collections import ConfigDict
 
 ResetFn = Callable[["SimData", "SimData", Array | None], "SimData"]
 """Reset pipeline stage: maps (data, default_data, mask) to the modified data."""
@@ -475,3 +478,35 @@ def build_disturb_wrench_fn(force_noise: float, torque_noise: float) -> StepFn:
         return data.replace(states=states, core=data.core.replace(rng_key=key))
 
     return disturb_wrench
+
+
+# region Setup
+def add_randomization(sim: Sim, rand: ConfigDict, n_substeps: int):
+    """Add the plugins and the reset and step stages of the ``rand`` config section to ``sim``.
+
+    Call before ``sim.build_default_data``, so resets restore the plugins.
+
+    Args:
+        sim: The simulator to modify in place.
+        rand: The ``randomization`` section of the environment config.
+        n_substeps: Sim steps per policy step, which the attitude delay needs.
+    """
+    delay_steps = round(rand.action_delay * sim.freq)  # 0.04 s * 500 Hz = 20
+    # Plugins must exist before build_default_data, so resets restore them
+    sim.data = add_delay_plugin(sim.data, delay_steps)
+    sim.data = add_wrench_plugin(sim.data)
+
+    append_fn(sim.reset_pipeline, build_randomize_mass_fn(rand.mass))
+    append_fn(sim.reset_pipeline, build_randomize_inertia_fn(rand.inertia))
+    append_fn(sim.reset_pipeline, build_randomize_rotor_dynamics_fn(rand.rotor_dynamics))
+    append_fn(sim.reset_pipeline, build_randomize_thrust_curve_fn(rand.thrust_curve))
+    append_fn(sim.reset_pipeline, build_randomize_torque_curve_fn(rand.torque_curve))
+    append_fn(sim.reset_pipeline, build_randomize_wrench_fn(rand.force, rand.torque))
+    append_fn(sim.reset_pipeline, build_randomize_delay_fn(delay_steps))
+    prepend_fn(sim.step_pipeline, build_delay_attitude_fn(n_substeps), name="delay")
+    insert_fn_before(
+        sim.step_pipeline,
+        "integration",
+        build_disturb_wrench_fn(rand.force_noise, rand.torque_noise),
+        name="disturb_wrench",
+    )
