@@ -5,7 +5,7 @@ point with a small leftover velocity and chases goals from the deployment range,
 tell whether a take-off controller can hand over to the policy. Afterwards a few episodes are
 replayed in Crazyflow's MuJoCo viewer.
 
-python -m chronosrl.evaluation.crazyflow.drone_reach_pos --run runs/chronosrl/crazyflow_position
+python -m chronosrl.evaluation.crazyflow.drone_reach_pos --run runs/crazyflow_position/srl
 """
 
 import argparse

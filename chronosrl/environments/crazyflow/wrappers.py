@@ -129,12 +129,18 @@ class EvalWrapper(Wrapper):
         episode = state.info["episode_metrics"]
         steps = state.info["episode_steps"]
 
+        done = episode["sequence_done"]
+        completed = done > 0
+
         metrics = {
             "time_at_goal": jnp.mean(episode["success"]),
             "goal_reached": jnp.mean(episode["success"] > 0),
             "time_at_goal_rest": jnp.mean(episode["rest_success"]),
             "goal_error": jnp.mean(episode["goal_error"] / jnp.maximum(steps, 1.0)),
             "episode_length": jnp.mean(steps),
+            "sequence_completed": jnp.mean(completed),
+            "time_to_complete": jnp.sum(jnp.where(completed, steps - done + 1.0, 0.0))
+            / jnp.maximum(jnp.sum(completed), 1.0),
         }
         # Only the maze env reports wall crashes
         if "crashed" in episode:

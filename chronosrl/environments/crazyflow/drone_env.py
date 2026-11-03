@@ -47,6 +47,10 @@ class DroneEnv:
         """
         assert config.sim_freq % config.freq == 0, "sim_freq must be a multiple of freq"
         self.nr_envs = nr_envs
+        self.nr_waypoints = config.task.nr_waypoints
+        self.dwell_steps = config.task.dwell_steps
+        self.observation_size = self.state_dim + self.nr_waypoints * 3
+
         self.episode_length = config.episode_length
         self.goal_radius = config.task.goal_radius
         self.rest_speed = config.task.rest_speed
@@ -104,9 +108,10 @@ class DroneEnv:
         rot_mat = obs[..., 3:12]
         vel = obs[..., 12:15]
         ang_vel = obs[..., 15:18]  # is already in body frame
-        goal = obs[..., self.state_dim :]
+        goals = obs[..., self.state_dim :].reshape(obs.shape[:-1] + (self.nr_waypoints, 3))
+        rel = (pos[..., None, :] - goals).reshape(obs.shape[:-1] + (3 * self.nr_waypoints,))
 
-        return jnp.concatenate([pos - goal, vel, rot_mat, ang_vel], axis=-1)
+        return jnp.concatenate([rel, vel, rot_mat, ang_vel], axis=-1)
 
     def observation(self, data: SimData, goal: jax.Array) -> jax.Array:
         """Build the ``(n, 21)`` observation ``[pos, rot_mat, vel, ang_vel, goal]``."""
@@ -118,7 +123,14 @@ class DroneEnv:
         rot_mat = rotation.as_matrix().reshape(-1, 9)
 
         return jnp.concatenate(
-            [states.pos[:, 0], rot_mat, states.vel[:, 0], states.ang_vel[:, 0], goal], axis=-1
+            [
+                states.pos[:, 0],
+                rot_mat,
+                states.vel[:, 0],
+                states.ang_vel[:, 0],
+                goal.reshape(goal.shape[0], -1),
+            ],
+            axis=-1,
         ).astype(jnp.float32)
 
     def spawn(
@@ -145,7 +157,10 @@ class DroneEnv:
             vel_key, shape, minval=-self.max_spawn_speed, maxval=self.max_spawn_speed
         )
         new_goal = jax.random.uniform(
-            goal_key, (self.nr_envs, 3), minval=self.goal_low, maxval=self.goal_high
+            goal_key,
+            (self.nr_envs, self.nr_waypoints, 3),
+            minval=self.goal_low,
+            maxval=self.goal_high,
         )
 
         data = self.sim._reset(data, self.sim.default_data, mask)
@@ -154,7 +169,7 @@ class DroneEnv:
             spawn_state["rotor_vel"] = jnp.full((self.nr_envs, 1, 4), self.hover_rotor_vel)
         data = data.replace(states=leaf_replace(data.states, mask, **spawn_state))
 
-        goal = new_goal if mask is None else jnp.where(mask[:, None], new_goal, goal)
+        goal = new_goal if mask is None else jnp.where(mask[:, None, None], new_goal, goal)
 
         return data, goal
 
@@ -176,8 +191,10 @@ class DroneEnv:
                 "seed": jnp.zeros((self.nr_envs,), jnp.int32),
                 "steps": zeros,
                 "truncation": zeros,
+                "progress": jnp.zeros((self.nr_envs,), jnp.int32),
+                "hold": jnp.zeros((self.nr_envs,), jnp.int32),
             },
-            metrics=self.evaluation_step_metrics(pos, vel, goal),
+            metrics={**self.evaluation_step_metrics(pos, vel, goal[:, 0]), "sequence_done": zeros},
         )
 
     def terminated(self, pos: jax.Array, vel: jax.Array) -> jax.Array:
@@ -216,11 +233,24 @@ class DroneEnv:
         truncated = (steps >= self.episode_length) & ~terminated
         done = terminated | truncated
 
+        progress = state.info["progress"]
+        at_goal = jnp.linalg.norm(pos - state.goal[:, 0], axis=-1) < self.goal_radius
+        last = progress == self.nr_waypoints - 1
+        hold = jnp.where(at_goal & last, state.info["hold"] + 1, 0)
+        # TODO this is not marcovian. IS it a problem?
+        passed = at_goal & (progress < self.nr_waypoints) & (~last | (hold >= self.dwell_steps))
+        popped = jnp.concatenate([state.goal[:, 1:], state.goal[:, -1:]], axis=1)
+        goal = jnp.where(passed[:, None, None], popped, state.goal)
+        progress = progress + passed
+
         # Measured before the autoreset, against the goal the drone was chasing
-        metrics = self.evaluation_step_metrics(pos, vel, state.goal)
+        metrics = {
+            **self.evaluation_step_metrics(pos, vel, state.goal[:, 0]),
+            "sequence_done": (progress >= self.nr_waypoints).astype(jnp.float32),
+        }
 
         # 3. Autoreset the envs that ended
-        data, goal = self.spawn(data, state.goal, spawn_key, mask=done)
+        data, goal = self.spawn(data, goal, spawn_key, mask=done)
 
         return state.replace(
             data=data,
@@ -233,6 +263,8 @@ class DroneEnv:
                 "seed": state.info["seed"] + done.astype(jnp.int32),
                 "steps": jnp.where(done, 0.0, steps),
                 "truncation": truncated.astype(jnp.float32),
+                "progress": jnp.where(done, 0, progress),
+                "hold": jnp.where(done, 0, hold),
             },
             metrics=metrics,
         )

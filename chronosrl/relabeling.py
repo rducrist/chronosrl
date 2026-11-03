@@ -53,6 +53,12 @@ def make_relabel_fn(
     probabilities = jnp.array(config.goal_probabilities, dtype=jnp.float32)
     probabilities = probabilities / jnp.sum(probabilities)
 
+    nr_waypoints = getattr(env, "nr_waypoints", 1)
+    dwell_steps = getattr(env, "dwell_steps", 1)
+    waypoints_or_dwell = nr_waypoints > 1 or dwell_steps > 1
+    assert not waypoints_or_dwell or m == 1, "waypoints and dwell need goal_sequence_length = 1"
+    assert not waypoints_or_dwell or cost_weight == 0.0, "waypoints and dwell need cost_weight = 0"
+
     def relabel(transitions: dict[str, jax.Array], key: jax.Array) -> dict[str, jax.Array]:
         """Relabels one window of transitions with hindsight goals and hitting times.
 
@@ -89,55 +95,138 @@ def make_relabel_fn(
                 len(starts), m * goal_size
             )
 
-        # Goal strategies: 0 = future goal of the same episode (geometric in dt),
-        # 1 = the currently achieved goal, 2 = a random achieved goal from the window
-        key_strategy, key_future, key_random = jax.random.split(key, 3)
-        future = same_episode & (dt >= 1) & sequence_start[None, :]
-        future_index = jax.random.categorical(
-            key_future,
-            jnp.log(
+        if waypoints_or_dwell:
+            # Goals are K waypoints visited in order. Only the first k are left to visit,
+            # the rest repeat the last one, as in the env after reaching the goals
+            key_strategy, key_future, key_random, key_remaining = jax.random.split(key, 4)
+            future = same_episode & (dt >= 1)
+
+            future_logits = jnp.log(
                 jnp.where(future, jnp.power(config.future_goal_gamma, dt.astype(jnp.float32)), 0.0)
                 + 1e-10
-            ),
-            axis=1,
-        )
-        future_index = jnp.where(jnp.any(future, axis=1), future_index, t)
-        random_goal = jnp.tile(achieved[jax.random.randint(key_random, (T,), 0, T)], (1, m))
-        strategy = jax.random.choice(key_strategy, 3, shape=(T,), p=probabilities)[:, None]
-        goal = jnp.where(
-            strategy == 0,
-            sequences(future_index),
-            jnp.where(strategy == 1, sequences(t), random_goal),
-        )
-        point_goal = goal[:, :goal_size]
+            )
+            # 0 = K sorted future steps of the same episode
+            # 1 = the current step
+            # 2 = K random steps of the window
+
+            future_index = jnp.sort(
+                jax.random.categorical(
+                    key_future, future_logits, axis=1, shape=(nr_waypoints, T)
+                ).T,
+                axis=1,
+            )
+
+            future_index = jnp.where(jnp.any(future, axis=1)[:, None], future_index, t[:, None])
+            current_index = jnp.tile(t[:, None], (1, nr_waypoints))
+            random_index = jax.random.randint(key_random, (T, nr_waypoints), 0, T)
+
+            index = jnp.stack([future_index, current_index, random_index])
+
+            strategy = jax.random.choice(key_strategy, 3, shape=(T,), p=probabilities)
+            index = index[strategy, t]  # (T, K)
+            remaining = jax.random.randint(key_remaining, (T,), 1, nr_waypoints + 1)
+            index = jnp.where(
+                jnp.arange(nr_waypoints)[None, :] < remaining[:, None],
+                index,
+                index[t, remaining - 1][:, None],
+            )
+            goal = achieved[index].reshape(T, nr_waypoints * goal_size)
+            point_goal = goal[:, :goal_size]
+
+        else:
+            # Goal strategies: 0 = future goal of the same episode (geometric in dt),
+            # 1 = the currently achieved goal, 2 = a random achieved goal from the window
+            key_strategy, key_future, key_random = jax.random.split(key, 3)
+            future = same_episode & (dt >= 1) & sequence_start[None, :]
+            future_index = jax.random.categorical(
+                key_future,
+                jnp.log(
+                    jnp.where(
+                        future, jnp.power(config.future_goal_gamma, dt.astype(jnp.float32)), 0.0
+                    )
+                    + 1e-10
+                ),
+                axis=1,
+            )
+            future_index = jnp.where(jnp.any(future, axis=1), future_index, t)
+            random_goal = jnp.tile(achieved[jax.random.randint(key_random, (T,), 0, T)], (1, m))
+            strategy = jax.random.choice(key_strategy, 3, shape=(T,), p=probabilities)[:, None]
+            goal = jnp.where(
+                strategy == 0,
+                sequences(future_index),
+                jnp.where(strategy == 1, sequences(t), random_goal),
+            )
+            point_goal = goal[:, :goal_size]
 
         # Goal-reaching time tau: first step at which the whole goal sequence is matched,
         # 0 if already matched
         # With per-step costs, time runs on the shaped clock
         # C_{t+1} = C_t + 1 + cost_weight * cost_t
         # match[t, s]: the goal of sample t is matched by the achieved sequence starting at s
-        candidates = sequences(t).reshape(T, m, goal_size)
-        match = jnp.all(
-            jnp.linalg.norm(goal.reshape(T, m, goal_size)[:, None] - candidates[None], axis=-1)
-            <= radius,
-            axis=-1,
-        )
-        future_match = match & same_episode[:, :T] & (dt[:, :T] >= 1)
+
         big = jnp.iinfo(jnp.int32).max  # Sentinel for "not reached"
-        if cost_weight > 0.0:
-            clock = 1.0 + cost_weight * jnp.maximum(transitions["cost"], 0.0)
-            shaped_time = jnp.cumsum(clock) - clock
-            shaped_dt = jnp.round(shaped_time[None, :T] - shaped_time[:T, None]).astype(jnp.int32)
-            first = jnp.min(jnp.where(future_match & (shaped_dt <= window), shaped_dt, big), axis=1)
-            censor = jnp.clip(jnp.round(shaped_time[T - 1] - shaped_time[:T]), 0, window).astype(
-                jnp.int32
-            )
-        else:
-            first = jnp.min(jnp.where(future_match, dt[:, :T], big), axis=1)
+        if waypoints_or_dwell:
+            # Waypoints are reached in order: each one at its first hit or after the hit of
+            # the previous one, starting from the anchor, so padded repeats cost no time
+            alive = same_episode & (dt >= 0)
+
+            def held(hit: jax.Array) -> jax.Array:
+                """True at step j if every step j, j + 1, ..., j + dwell_steps - 1 is a hit."""
+                hold_steps = j[:, None] + jnp.arange(dwell_steps)[None, :]  # (J, dwell_steps)
+                inside = hold_steps < J  # a hold may not run past the end of the window
+                hold_hits = hit[:, jnp.clip(hold_steps, 0, J - 1)]  # (T, J, dwell_steps)
+                return jnp.all(hold_hits & inside, axis=-1)
+
+            def reach(
+                reached_at: jax.Array, xs: tuple[jax.Array, jax.Array]
+            ) -> tuple[jax.Array, None]:
+                """First step from `reached_at` within radius of the waypoint (held if last)."""
+                waypoint, is_last = xs
+                hit = alive & (
+                    jnp.linalg.norm(waypoint[:, None] - achieved[None], axis=-1) <= radius
+                )
+                hit = jnp.where(is_last, held(hit), hit)
+                reached_at = jnp.min(
+                    jnp.where(hit & (j[None, :] >= reached_at[:, None]), j[None, :], big), axis=1
+                )
+                return reached_at, None
+
+            # Scan over the waypoints, (K, T, goal_size)
+            waypoints = goal.reshape(T, nr_waypoints, goal_size).swapaxes(0, 1)
+            is_last = jnp.arange(nr_waypoints) == nr_waypoints - 1
+            reached_at, _ = jax.lax.scan(reach, t, (waypoints, is_last))
+
+            is_event = reached_at < big
+            # Reached at the end of the hold, the step at which the env completes the sequence
+            tau = jnp.clip(jnp.where(is_event, reached_at + dwell_steps - 1 - t, 0), 0, window)
             censor = jnp.full((T,), window, dtype=jnp.int32)
-        reached_now = jnp.diagonal(match)
-        is_event = reached_now | (first < big)
-        tau = jnp.clip(jnp.where(reached_now, 0, first), 0, window)
+
+        else:
+            candidates = sequences(t).reshape(T, m, goal_size)
+            match = jnp.all(
+                jnp.linalg.norm(goal.reshape(T, m, goal_size)[:, None] - candidates[None], axis=-1)
+                <= radius,
+                axis=-1,
+            )
+            future_match = match & same_episode[:, :T] & (dt[:, :T] >= 1)
+            if cost_weight > 0.0:
+                clock = 1.0 + cost_weight * jnp.maximum(transitions["cost"], 0.0)
+                shaped_time = jnp.cumsum(clock) - clock
+                shaped_dt = jnp.round(shaped_time[None, :T] - shaped_time[:T, None]).astype(
+                    jnp.int32
+                )
+                first = jnp.min(
+                    jnp.where(future_match & (shaped_dt <= window), shaped_dt, big), axis=1
+                )
+                censor = jnp.clip(
+                    jnp.round(shaped_time[T - 1] - shaped_time[:T]), 0, window
+                ).astype(jnp.int32)
+            else:
+                first = jnp.min(jnp.where(future_match, dt[:, :T], big), axis=1)
+                censor = jnp.full((T,), window, dtype=jnp.int32)
+            reached_now = jnp.diagonal(match)
+            is_event = reached_now | (first < big)
+            tau = jnp.clip(jnp.where(reached_now, 0, first), 0, window)
 
         # Action chunks are valid only inside the window and the episode
         index = t[:, None] + jnp.arange(chunk)[None, :]
@@ -158,7 +247,11 @@ def make_relabel_fn(
 
         batch = {
             "observation": jnp.concatenate(
-                [transitions["observation"][:T, :state_dim], point_goal], axis=-1
+                [
+                    transitions["observation"][:T, :state_dim],
+                    goal if waypoints_or_dwell else point_goal,
+                ],
+                axis=-1,
             ),
             "goal": goal,
             "action": action,

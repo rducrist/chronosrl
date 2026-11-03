@@ -9,6 +9,8 @@ import os
 import pickle
 import sys
 import time
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -23,80 +25,98 @@ from chronosrl.environments import get_environment
 from chronosrl.networks import Policy
 
 
-def rollout_crazyflow(
-    args: argparse.Namespace, run: Path, config: dict[str, Any], checkpoint: dict[str, Any]
-) -> None:
-    """Roll out a native crazyflow checkpoint, save metrics and replay it in MuJoCo.
+#region Crazyflow
+@dataclass
+class Episode:
+    """One rolled-out crazyflow episode in a single world."""
 
-    Args:
-        args: Parsed command-line arguments of `main`.
-        run: Run directory containing `model.pkl`.
-        config: Saved run config with "environment" and "algorithm" sections.
-        checkpoint: Unpickled `model.pkl`; its "policy" entry holds the policy params.
-    """
-    import mujoco
-    from ml_collections import config_dict
+    frames: list[tuple[Any, np.ndarray, int]]  # (sim data, goals (K, 3), goals reached) per step
+    successes: list[float] = field(default_factory=list)
+    errors: list[float] = field(default_factory=list)
+    sequence_done: list[float] = field(default_factory=list)
+    crashed: bool = False  # ended by termination rather than the episode_length truncation
 
-    from chronosrl.environments.crazyflow import make_env
 
-    env_config = config_dict.ConfigDict(config["environment"])
-    env_config.device = args.device
-    if "maze" in env_config:
-        env_config.maze.random_start = False  # always start in the R cell
-
-    env = make_env(env_config, nr_envs=1)
-    dt = 1.0 / env_config.freq
-    algorithm = config["algorithm"]
+def make_actor(
+    env: Any, algorithm: dict[str, Any], params: Any
+) -> Callable[[jax.Array], jax.Array]:
+    """Return the deterministic policy: obs to a ``(1, chunk_length, action_size)`` chunk."""
     chunk_length = algorithm["action_chunk_length"]
     policy = Policy(env.action_size * chunk_length, algorithm["width"], algorithm["depth"])
-    params = checkpoint["policy"]
-    reset, step = jax.jit(env.reset), jax.jit(env.step)
     # Deterministic policy: tanh of the mean, a flat chunk of `chunk_length` actions.
     act = jax.jit(lambda obs: jnp.tanh(policy.apply(params, env.policy_observation(obs))[0]))
-    print(
-        f"Rolling out {run.name} ({env_config.name}), seed {args.seed}, device {args.device}",
-        flush=True,
-    )
-    state = reset(jax.random.split(jax.random.PRNGKey(args.seed), 1))
-    # Each frame is the sim data plus the goal the drone is chasing.
-    frames = [(state.data, np.asarray(state.goal[0]))]
-    successes, errors = [], []
-    ended = False
-    for index in range(args.steps):
+    return lambda obs: act(obs).reshape(1, chunk_length, env.action_size)
+
+
+def run_episode(
+    reset: Callable,
+    step: Callable,
+    act: Callable[[jax.Array], jax.Array],
+    chunk_length: int,
+    key: jax.Array,
+    max_steps: int,
+) -> Episode:
+    """Spawn a single world from ``key`` and roll out one episode of at most ``max_steps``."""
+    state = reset(key[None])
+    goals = np.asarray(state.goal[0])  # (K, 3), the whole sequence before any goal is reached
+    episode = Episode(frames=[(state.data, goals, 0)])
+    for index in range(max_steps):
         # Query the policy once per chunk and execute the chunk's actions open-loop.
         if index % chunk_length == 0:
-            chunk = act(state.obs).reshape(1, chunk_length, env.action_size)
+            chunk = act(state.obs)
         state = step(state, chunk[:, index % chunk_length])
-        successes.append(float(state.metrics["success"][0]))
-        errors.append(float(state.metrics["goal_error"][0]))
+        episode.successes.append(float(state.metrics["success"][0]))
+        episode.errors.append(float(state.metrics["goal_error"][0]))
+        episode.sequence_done.append(float(state.metrics["sequence_done"][0]))
         if bool(state.done[0]):
             # Same-step autoreset returns a different episode: omit that frame.
-            ended = True
+            episode.crashed = not bool(state.info["truncation"][0])
             break
-        frames.append((state.data, np.asarray(state.goal[0])))
-    output = args.output or run / f"rollout{epoch_suffix(args)}_seed{args.seed}.json"
-    if output.suffix != ".json":
-        raise ValueError(
-            "Crazyflow --output must be a .json metrics file; playback uses its native viewer"
-        )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    metrics = {
-        "run": str(run),
-        "environment": env_config.name,
-        "seed": args.seed,
-        "steps": len(successes),
-        "time_at_goal": float(np.sum(successes)),
-        "goal_reached": bool(np.any(successes)),
-        "goal_error": float(np.mean(errors)),
-        "episode_ended": ended,
-    }
-    output.write_text(json.dumps(metrics, indent=2) + "\n")
-    print(json.dumps(metrics, indent=2), flush=True)
-    print(f"Metrics: {output.resolve()}", flush=True)
-    if args.no_render:
-        env.sim.close()
-        return
-    print("Opening Crazyflow's native MuJoCo viewer (red marker = target).", flush=True)
+        episode.frames.append((state.data, goals, int(state.info["progress"][0])))
+    return episode
+
+
+def summarize(episodes: list[Episode]) -> dict[str, Any]:
+    """Return the metrics of every episode and their means over all episodes."""
+    per_episode = [
+        {
+            "spawn": np.asarray(episode.frames[0][0].states.pos[0, 0], float).round(3).tolist(),
+            "goals": episode.frames[0][1].astype(float).round(3).tolist(),
+            "steps": len(episode.successes),
+            "time_at_goal": float(np.sum(episode.successes)),
+            "goal_reached": bool(np.any(episode.successes)),
+            "goal_error": float(np.mean(episode.errors)),
+            "sequence_completed": bool(np.any(episode.sequence_done)),
+            # sequence_done stays 1 from the step the last goal is reached to the episode end
+            "time_to_complete": (
+                len(episode.sequence_done) - float(np.sum(episode.sequence_done)) + 1.0
+                if np.any(episode.sequence_done)
+                else None
+            ),
+            "crashed": episode.crashed,
+        }
+        for episode in episodes
+    ]
+    names = ("steps", "time_at_goal", "goal_reached", "goal_error", "sequence_completed", "crashed")
+    mean = {name: float(np.mean([metrics[name] for metrics in per_episode])) for name in names}
+    # Over the completed episodes only
+    times = [m["time_to_complete"] for m in per_episode if m["time_to_complete"] is not None]
+    mean["time_to_complete"] = float(np.mean(times)) if times else None
+    return {"mean": mean, "episodes": per_episode}
+
+
+def play(
+    env: Any, frames: list[tuple[Any, np.ndarray, int]], dt: float, fps: float, loop: bool
+) -> None:
+    """Replay ``(sim data, goals, goals reached)`` frames, ``dt`` s apart, in the MuJoCo viewer."""
+    import glfw
+    import mujoco
+
+    print(
+        "Opening Crazyflow's native MuJoCo viewer "
+        "(red = current goal, orange = later goals, green = reached).",
+        flush=True,
+    )
     # Maze envs: walls exist only as xy cells, drawn as boxes up to the ceiling of the bounds
     wall_xy = np.asarray(getattr(env, "wall_xy", np.zeros((0, 2))))
     cam_config = None
@@ -111,41 +131,115 @@ def rollout_crazyflow(
             "distance": 1.2 * max(rows, cols) * env.scaling,
             "elevation": -60.0,
         }
-    try:
-        import glfw
-
-        frame_count = int(np.ceil((len(frames) - 1) * dt * args.fps)) + 1
-        while True:
-            started = time.perf_counter()
-            for index in range(frame_count):
-                viewer = env.sim.viewer
-                if viewer is not None:
-                    window = viewer.viewer.window
-                    if window is None or glfw.window_should_close(window):
-                        return
-                data, goal = frames[min(int(index / (args.fps * dt)), len(frames) - 1)]
-                env.sim.data = data
-                if viewer is not None:
-                    # The viewer clears markers after every render, so re-add the goal each frame.
+    frame_count = int(np.ceil((len(frames) - 1) * dt * fps)) + 1
+    while True:
+        started = time.perf_counter()
+        for index in range(frame_count):
+            viewer = env.sim.viewer
+            if viewer is not None:
+                window = viewer.viewer.window
+                if window is None or glfw.window_should_close(window):
+                    return
+            data, goals, progress = frames[min(int(index / (fps * dt)), len(frames) - 1)]
+            env.sim.data = data
+            if viewer is not None:
+                # The viewer clears markers after every render, so re-add the goals each frame.
+                # Reached goals green, the current one red, the later ones faded orange
+                for k, goal in enumerate(goals):
+                    if k < progress:
+                        rgba = [0.0, 1.0, 0.0, 0.3]
+                    elif k == progress:
+                        rgba = [1.0, 0.0, 0.0, 0.6]
+                    else:
+                        rgba = [1.0, 0.6, 0.0, 0.3]
                     viewer.viewer.add_marker(
                         type=mujoco.mjtGeom.mjGEOM_SPHERE,
                         pos=goal,
                         size=np.full(3, env.goal_radius),
-                        rgba=np.array([1.0, 0.0, 0.0, 0.5]),
+                        rgba=np.array(rgba),
+                        label=str(k + 1),
+                    )
+                for x, y in wall_xy:
+                    viewer.viewer.add_marker(
+                        type=mujoco.mjtGeom.mjGEOM_BOX,
+                        pos=np.array([x, y, wall_size[2]]),
+                        size=wall_size,
+                        rgba=np.array([0.7, 0.5, 0.3, 0.5]),
                         label="",
                     )
-                    for x, y in wall_xy:
-                        viewer.viewer.add_marker(
-                            type=mujoco.mjtGeom.mjGEOM_BOX,
-                            pos=np.array([x, y, wall_size[2]]),
-                            size=wall_size,
-                            rgba=np.array([0.7, 0.5, 0.3, 0.5]),
-                            label="",
-                        )
-                env.sim.render(world=0, cam_config=cam_config)
-                time.sleep(max(0.0, started + (index + 1) / args.fps - time.perf_counter()))
-            if not args.loop:
-                break
+            env.sim.render(world=0, cam_config=cam_config)
+            time.sleep(max(0.0, started + (index + 1) / fps - time.perf_counter()))
+        if not loop:
+            break
+
+
+def rollout_crazyflow(
+    args: argparse.Namespace, run: Path, config: dict[str, Any], checkpoint: dict[str, Any]
+) -> None:
+    """Roll out ``args.episodes`` episodes from different spawns, save metrics and replay them.
+
+    Every episode is reset from its own key, so the env's spawn sampling gives each one a new
+    spawn and goal, and episode ``i`` gets the same spawn for the same ``args.seed``.
+
+    Args:
+        args: Parsed command-line arguments of `main`.
+        run: Run directory containing `model.pkl`.
+        config: Saved run config with "environment" and "algorithm" sections.
+        checkpoint: Unpickled `model.pkl`; its "policy" entry holds the policy params.
+    """
+    from ml_collections import config_dict
+
+    from chronosrl.environments.crazyflow import make_env
+    from chronosrl.environments.crazyflow.wrappers import Wrapper
+
+    output = args.output or run / f"rollout{epoch_suffix(args)}_seed{args.seed}.json"
+    if output.suffix != ".json":
+        raise ValueError(
+            "Crazyflow --output must be a .json metrics file; playback uses its native viewer"
+        )
+    env_config = config_dict.ConfigDict(config["environment"])
+    env_config.device = args.device
+    # Runs from before goal sequences have neither key, early goal sequence runs use nr_goals
+    if "nr_waypoints" not in env_config.task:
+        env_config.task.nr_waypoints = env_config.task.get("nr_goals", 1)
+    if "dwell_steps" not in env_config.task:
+        env_config.task.dwell_steps = 1
+    # The wrappers the config enables set the action size the policy was trained with
+    env = make_env(env_config, nr_envs=1)
+    if args.goal_cell is not None:
+        # Only this cell as goal: spawn reads goal_xy when reset/step are traced
+        maze = env
+        while isinstance(maze, Wrapper):
+            maze = maze.env
+        maze.goal_xy = jnp.array([args.goal_cell], jnp.float32) * maze.scaling  # (1, 2)
+    algorithm = config["algorithm"]
+    act = make_actor(env, algorithm, checkpoint["policy"])
+    reset, step = jax.jit(env.reset), jax.jit(env.step)
+    print(
+        f"Rolling out {run.name} ({env_config.name}) for {args.episodes} episodes, "
+        f"seed {args.seed}, device {args.device}",
+        flush=True,
+    )
+    try:
+        keys = jax.random.split(jax.random.PRNGKey(args.seed), args.episodes)
+        episodes = [
+            run_episode(reset, step, act, algorithm["action_chunk_length"], key, args.steps)
+            for key in keys
+        ]
+        metrics = {
+            "run": str(run),
+            "environment": env_config.name,
+            "seed": args.seed,
+            **summarize(episodes),
+        }
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(metrics, indent=2) + "\n")
+        print(json.dumps(metrics["mean"], indent=2), flush=True)
+        print(f"Metrics: {output.resolve()}", flush=True)
+        if not args.no_render:
+            # Episodes play back to back
+            frames = [frame for episode in episodes for frame in episode.frames]
+            play(env, frames, 1.0 / env_config.freq, args.fps, args.loop)
     finally:
         env.sim.close()
 
@@ -179,6 +273,7 @@ def pendulum_frame(
     return np.asarray(image)
 
 
+#region Pendulum
 def rollout_pendulum(
     args: argparse.Namespace, run: Path, config: dict[str, Any], checkpoint: dict[str, Any]
 ) -> None:
@@ -259,56 +354,37 @@ def epoch_suffix(args: argparse.Namespace) -> str:
     return "" if args.epoch is None else f"_epoch{args.epoch:03d}"
 
 
-def main():
-    """Parse arguments, load the run's config and checkpoint, and roll out the policy."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run", type=Path, default=Path("runs/srl/default"))
-    parser.add_argument("--environment", help="Override the saved environment name")
-    parser.add_argument(
-        "--epoch", type=int, help="Load checkpoints/epoch_<N>.pkl instead of the latest model.pkl"
-    )
-    parser.add_argument("--seed", type=int, default=1000)
-    parser.add_argument("--steps", type=int, default=1000)
-    parser.add_argument("--fps", type=float, default=60, help="Playback frames per second")
-    parser.add_argument("--output", type=Path)
-    parser.add_argument(
-        "--device", choices=("cpu", "gpu"), default="cpu", help="Crazyflow rollout device"
-    )
-    parser.add_argument(
-        "--no-render",
-        action="store_true",
-        help="Crazyflow: compute metrics without opening a window",
-    )
-    parser.add_argument(
-        "--loop", action="store_true", help="Crazyflow: repeat playback until the window is closed"
-    )
-    parser.add_argument(
-        "--source-repo",
-        type=Path,
-        default=Path(__file__).resolve().parents[2] / "survival-reinforcement-learning",
-        help="Original SRL repository (needed for args.pkl checkpoints)",
-    )
-    args = parser.parse_args()
-    if args.steps < 1:
-        parser.error("--steps must be positive")
-    if not np.isfinite(args.fps) or args.fps <= 0:
-        parser.error("--fps must be finite and positive")
-    run = args.run.resolve()
-    # A parent directory is also accepted: use its last run (by name) with a model.pkl.
+def load_run(
+    path: Path, epoch: int | None
+) -> tuple[Path, dict[str, Any], Any, dict[str, Any] | None]:
+    """Find a run directory and load its config and checkpoint.
+
+    Config sources: the original SRL args.pkl (if there is no config.json), the runner's
+    config.json, or as a last resort the matching wandb config.yaml.
+
+    Args:
+        path: Run directory, or a parent whose last run (by name) with a model.pkl is used.
+        epoch: Load checkpoints/epoch_<N>.pkl instead of the latest model.pkl.
+
+    Returns:
+        The run directory, its config with "environment" and "algorithm" sections, the unpickled
+        checkpoint and the original SRL config (None for native runs).
+    """
+    run = path.resolve()
     if not (run / "model.pkl").exists():
         candidates = sorted(run.glob("*/model.pkl"), key=lambda p: p.parent.name)
         if not candidates:
-            parser.error(f"No model.pkl found in {run}")
+            raise FileNotFoundError(f"No model.pkl found in {run}")
         run = candidates[-1].parent
     config_path = run / "config.json"
     original_config = None
-    # Config sources: original SRL args.pkl (if no config.json), the runner's config.json,
-    # or as a last resort the matching wandb config.yaml.
     if (run / "args.pkl").exists() and not config_path.exists():
         try:
             from omegaconf import OmegaConf
-        except ImportError:
-            parser.error("Reading args.pkl requires omegaconf in the benchmark environment")
+        except ImportError as error:
+            raise ImportError(
+                "Reading args.pkl requires omegaconf in the benchmark environment"
+            ) from error
         with (run / "args.pkl").open("rb") as file:
             original_config = OmegaConf.to_container(pickle.load(file), resolve=True)
         architecture = original_config["architecture"]
@@ -323,10 +399,9 @@ def main():
     elif config_path.exists():
         config = json.loads(config_path.read_text())
     else:
-        configs = sorted(Path("wandb").glob("run-*-*/files/config.yaml"))
         config = None
-        for path in configs:
-            saved = yaml.safe_load(path.read_text())
+        for config_file in sorted(Path("wandb").glob("run-*-*/files/config.yaml")):
+            saved = yaml.safe_load(config_file.read_text())
             runner = saved.get("runner", {}).get("value", {})
             if str(runner.get("run_name")) == run.name:
                 config = {
@@ -334,21 +409,76 @@ def main():
                 }
                 break
         if config is None:
-            parser.error(
+            raise FileNotFoundError(
                 f"No saved config for {run}; expected config.json or matching wandb config"
             )
+    checkpoint_path = run / "model.pkl"
+    if epoch is not None:
+        checkpoint_path = run / "checkpoints" / f"epoch_{epoch:03d}.pkl"
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"No checkpoint for epoch {epoch}: {checkpoint_path}")
+    with checkpoint_path.open("rb") as file:
+        checkpoint = pickle.load(file)
+    return run, config, checkpoint, original_config
+
+
+def main():
+    """Parse arguments, load the run's config and checkpoint, and roll out the policy."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run", type=Path, default=Path("runs/srl/default"))
+    parser.add_argument("--environment", help="Override the saved environment name")
+    parser.add_argument(
+        "--epoch", type=int, help="Load checkpoints/epoch_<N>.pkl instead of the latest model.pkl"
+    )
+    parser.add_argument("--seed", type=int, default=1000)
+    parser.add_argument(
+        "--steps", type=int, default=1000, help="Max policy steps (per episode for Crazyflow)"
+    )
+    parser.add_argument(
+        "--episodes", type=int, default=10, help="Crazyflow: episodes, each from a new spawn"
+    )
+    parser.add_argument("--fps", type=float, default=60, help="Playback frames per second")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--device", choices=("cpu", "gpu"), default="cpu", help="Crazyflow rollout device"
+    )
+    parser.add_argument(
+        "--no-render",
+        action="store_true",
+        help="Crazyflow: compute metrics without opening a window",
+    )
+    parser.add_argument(
+        "--loop", action="store_true", help="Crazyflow: repeat playback until the window is closed"
+    )
+    parser.add_argument(
+        "--goal-cell",
+        type=int,
+        nargs=2,
+        metavar=("I", "J"),
+        help="Crazyflow maze: always use this (row, col) cell as the goal",
+    )
+    parser.add_argument(
+        "--source-repo",
+        type=Path,
+        default=Path(__file__).resolve().parents[2] / "survival-reinforcement-learning",
+        help="Original SRL repository (needed for args.pkl checkpoints)",
+    )
+    args = parser.parse_args()
+    if args.steps < 1:
+        parser.error("--steps must be positive")
+    if args.episodes < 1:
+        parser.error("--episodes must be positive")
+    if not np.isfinite(args.fps) or args.fps <= 0:
+        parser.error("--fps must be finite and positive")
+    try:
+        run, config, checkpoint, original_config = load_run(args.run, args.epoch)
+    except (FileNotFoundError, ImportError) as error:
+        parser.error(str(error))
     name = args.environment or config["environment"]["name"]
     if name.startswith("go2"):
         parser.error("This viewer currently supports JaxGCRL environments only")
     algorithm = config["algorithm"]
     chunk_length = algorithm["action_chunk_length"]
-    checkpoint_path = run / "model.pkl"
-    if args.epoch is not None:
-        checkpoint_path = run / "checkpoints" / f"epoch_{args.epoch:03d}.pkl"
-        if not checkpoint_path.exists():
-            parser.error(f"No checkpoint for epoch {args.epoch}: {checkpoint_path}")
-    with checkpoint_path.open("rb") as file:
-        checkpoint = pickle.load(file)
     if name.startswith("crazyflow_"):
         from chronosrl.environments.crazyflow import ENVS
 
@@ -374,6 +504,7 @@ def main():
         from srl.envs import make_env
         from srl.utils.actors import Actor
 
+        architecture = original_config["architecture"]
         activation_name = architecture["activation"].lower()
         if activation_name not in ("swish", "silu", "relu", "gelu", "elu"):
             parser.error(f"Unsupported original actor activation: {activation_name}")

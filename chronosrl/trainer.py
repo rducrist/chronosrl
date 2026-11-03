@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import os
+
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import pickle
 import shutil
 import time
@@ -74,6 +77,7 @@ class Trainer:
         self.state_dim = train_env.state_dim
         self.action_size = train_env.action_size
         self.goal_size = train_env.goal_indices[1] - train_env.goal_indices[0]
+        self.nr_waypoints = getattr(train_env, "nr_waypoints", 1)
         self.target_entropy = (
             config.algorithm.entropy_per_action_dim * self.action_size * self.action_chunk_length
         )
@@ -107,7 +111,7 @@ class Trainer:
                 critic_key,
                 jnp.ones((1, self.state_dim)),
                 jnp.ones((1, self.action_size * self.action_chunk_length)),
-                jnp.ones((1, self.goal_size * self.goal_sequence_length)),
+                jnp.ones((1, self.goal_size * self.goal_sequence_length * self.nr_waypoints)),
             ),
             tx=optax.adam(self.learning_rate),
         )

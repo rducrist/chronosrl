@@ -127,7 +127,7 @@ class DroneMazeEnv(DroneEnv):
         # vel_body = rotation.apply(vel, inverse=True)
         ang_vel = obs[..., 15 : self.state_dim]  # is already in body frame
 
-        return jnp.concatenate([pos, self.scaling * (pos - goal), vel, rot_mat, ang_vel], axis=-1)
+        return jnp.concatenate([pos, goal, vel, rot_mat, ang_vel], axis=-1)
 
     def observation(self, data: SimData, goal: jax.Array) -> jax.Array:
         """Base obs with position and goal in maze units."""
