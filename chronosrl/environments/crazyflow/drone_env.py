@@ -37,6 +37,7 @@ class DroneEnv:
     """
 
     state_dim, observation_size, action_size, goal_indices = 18, 21, 4, (0, 3)
+    velocity_indices = (12, 15)  # the drone velocity, the rest condition of the last waypoint
 
     def __init__(self, config: config_dict.ConfigDict, nr_envs: int):
         """Build the batched simulator and precompute the action, bound and spawn ranges.
@@ -48,7 +49,7 @@ class DroneEnv:
         assert config.sim_freq % config.freq == 0, "sim_freq must be a multiple of freq"
         self.nr_envs = nr_envs
         self.nr_waypoints = config.task.nr_waypoints
-        self.dwell_steps = config.task.dwell_steps
+        self.rest_at_end = config.task.rest_at_end
         self.observation_size = self.state_dim + self.nr_waypoints * 3
 
         self.episode_length = config.episode_length
@@ -192,7 +193,6 @@ class DroneEnv:
                 "steps": zeros,
                 "truncation": zeros,
                 "progress": jnp.zeros((self.nr_envs,), jnp.int32),
-                "hold": jnp.zeros((self.nr_envs,), jnp.int32),
             },
             metrics={**self.evaluation_step_metrics(pos, vel, goal[:, 0]), "sequence_done": zeros},
         )
@@ -236,9 +236,10 @@ class DroneEnv:
         progress = state.info["progress"]
         at_goal = jnp.linalg.norm(pos - state.goal[:, 0], axis=-1) < self.goal_radius
         last = progress == self.nr_waypoints - 1
-        hold = jnp.where(at_goal & last, state.info["hold"] + 1, 0)
-        # TODO this is not marcovian. IS it a problem?
-        passed = at_goal & (progress < self.nr_waypoints) & (~last | (hold >= self.dwell_steps))
+        # With rest_at_end the last waypoint also needs the drone at rest
+        at_rest = jnp.linalg.norm(vel, axis=-1) < self.rest_speed
+        arrived = at_goal & (at_rest | ~last) if self.rest_at_end else at_goal
+        passed = arrived & (progress < self.nr_waypoints)
         popped = jnp.concatenate([state.goal[:, 1:], state.goal[:, -1:]], axis=1)
         goal = jnp.where(passed[:, None, None], popped, state.goal)
         progress = progress + passed
@@ -264,7 +265,6 @@ class DroneEnv:
                 "steps": jnp.where(done, 0.0, steps),
                 "truncation": truncated.astype(jnp.float32),
                 "progress": jnp.where(done, 0, progress),
-                "hold": jnp.where(done, 0, hold),
             },
             metrics=metrics,
         )

@@ -7,7 +7,7 @@
 [runner]
 exp_name = "crazyflow_position"
 checkpoint_every = 10 # keep checkpoints/epoch_<N>.pkl every N epochs (0: only the latest model.pkl)
-tag = "goal-sequencing_dwell"
+tag = "goal-sequencing_velocity"
 
 # Applied to every algorithm
 [algorithm]
@@ -58,8 +58,8 @@ max_delta = 0.2 # max change per policy step, in [-1, 1] action units
 [environment.task]
 goal_radius = 0.05
 rest_speed = 0.05
-nr_waypoints = 3
-dwell_steps = 1 # steps to hold the last waypoint, 1 = touch once
+nr_waypoints = 2
+rest_at_end = true # the last waypoint also needs a speed below rest_speed
 
 # Episodes terminate when the drone leaves this box
 [environment.bounds]

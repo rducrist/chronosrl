@@ -202,8 +202,8 @@ def rollout_crazyflow(
     # Runs from before goal sequences have neither key, early goal sequence runs use nr_goals
     if "nr_waypoints" not in env_config.task:
         env_config.task.nr_waypoints = env_config.task.get("nr_goals", 1)
-    if "dwell_steps" not in env_config.task:
-        env_config.task.dwell_steps = 1
+    if "rest_at_end" not in env_config.task:
+        env_config.task.rest_at_end = False
     # The wrappers the config enables set the action size the policy was trained with
     env = make_env(env_config, nr_envs=1)
     if args.goal_cell is not None:

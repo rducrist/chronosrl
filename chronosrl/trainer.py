@@ -78,6 +78,10 @@ class Trainer:
         self.action_size = train_env.action_size
         self.goal_size = train_env.goal_indices[1] - train_env.goal_indices[0]
         self.nr_waypoints = getattr(train_env, "nr_waypoints", 1)
+        # With rest_at_end the critic goal also holds the velocity at the last waypoint
+        self.rest_at_end = getattr(train_env, "rest_at_end", False)
+        vel_start, vel_end = getattr(train_env, "velocity_indices", (0, 0))
+        self.goal_velocity_size = vel_end - vel_start if self.rest_at_end else 0
         self.target_entropy = (
             config.algorithm.entropy_per_action_dim * self.action_size * self.action_chunk_length
         )
@@ -105,13 +109,16 @@ class Trainer:
             ),
             tx=optax.adam(self.learning_rate),
         )
+        critic_goal_size = (
+            self.goal_size * self.goal_sequence_length * self.nr_waypoints + self.goal_velocity_size
+        )
         self.critic_state = TrainState.create(
             apply_fn=self.algorithm.critic.apply,
             params=self.algorithm.critic.init(
                 critic_key,
                 jnp.ones((1, self.state_dim)),
                 jnp.ones((1, self.action_size * self.action_chunk_length)),
-                jnp.ones((1, self.goal_size * self.goal_sequence_length * self.nr_waypoints)),
+                jnp.ones((1, critic_goal_size)),
             ),
             tx=optax.adam(self.learning_rate),
         )
@@ -280,6 +287,11 @@ class Trainer:
             state = observation[:, : self.state_dim]
             # The commanded goal, repeated for every step of the critic's goal sequence.
             goal = jnp.tile(observation[:, self.state_dim :], (1, self.goal_sequence_length))
+            if self.rest_at_end:
+                # Arrive at rest: zero velocity at the last waypoint
+                goal = jnp.concatenate(
+                    [goal, jnp.zeros((goal.shape[0], self.goal_velocity_size))], axis=-1
+                )
             alpha = jnp.exp(alpha_state.params["log_alpha"])
 
             def policy_loss_fn(policy_params: Any) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:

@@ -54,10 +54,13 @@ def make_relabel_fn(
     probabilities = probabilities / jnp.sum(probabilities)
 
     nr_waypoints = getattr(env, "nr_waypoints", 1)
-    dwell_steps = getattr(env, "dwell_steps", 1)
-    waypoints_or_dwell = nr_waypoints > 1 or dwell_steps > 1
-    assert not waypoints_or_dwell or m == 1, "waypoints and dwell need goal_sequence_length = 1"
-    assert not waypoints_or_dwell or cost_weight == 0.0, "waypoints and dwell need cost_weight = 0"
+    rest_at_end = getattr(env, "rest_at_end", False)
+    waypoints_or_rest = nr_waypoints > 1 or rest_at_end
+    assert not waypoints_or_rest or m == 1, "waypoints and rest need goal_sequence_length = 1"
+    assert not waypoints_or_rest or cost_weight == 0.0, "waypoints and rest need cost_weight = 0"
+    if rest_at_end:
+        vel_start, vel_end = env.velocity_indices
+        rest_speed = env.rest_speed
 
     def relabel(transitions: dict[str, jax.Array], key: jax.Array) -> dict[str, jax.Array]:
         """Relabels one window of transitions with hindsight goals and hitting times.
@@ -79,6 +82,8 @@ def make_relabel_fn(
         j = jnp.arange(J)
         t = jnp.arange(T)
         achieved = transitions["observation"][:, goal_start:goal_end]
+        if rest_at_end:
+            achieved_vel = transitions["observation"][:, vel_start:vel_end]
         seed = transitions["seed"].astype(jnp.int32)
         same_episode = seed[:T, None] == seed[None, :]
         dt = j[None, :] - t[:, None]
@@ -95,7 +100,7 @@ def make_relabel_fn(
                 len(starts), m * goal_size
             )
 
-        if waypoints_or_dwell:
+        if waypoints_or_rest:
             # Goals are K waypoints visited in order. Only the first k are left to visit,
             # the rest repeat the last one, as in the env after reaching the goals
             key_strategy, key_future, key_random, key_remaining = jax.random.split(key, 4)
@@ -132,6 +137,9 @@ def make_relabel_fn(
             )
             goal = achieved[index].reshape(T, nr_waypoints * goal_size)
             point_goal = goal[:, :goal_size]
+            if rest_at_end:
+                # The velocity the drone had at the last waypoint, (T, 3)
+                goal_velocity = achieved_vel[index[:, -1]]
 
         else:
             # Goal strategies: 0 = future goal of the same episode (geometric in dt),
@@ -165,27 +173,27 @@ def make_relabel_fn(
         # match[t, s]: the goal of sample t is matched by the achieved sequence starting at s
 
         big = jnp.iinfo(jnp.int32).max  # Sentinel for "not reached"
-        if waypoints_or_dwell:
+        if waypoints_or_rest:
             # Waypoints are reached in order: each one at its first hit or after the hit of
             # the previous one, starting from the anchor, so padded repeats cost no time
             alive = same_episode & (dt >= 0)
 
-            def held(hit: jax.Array) -> jax.Array:
-                """True at step j if every step j, j + 1, ..., j + dwell_steps - 1 is a hit."""
-                hold_steps = j[:, None] + jnp.arange(dwell_steps)[None, :]  # (J, dwell_steps)
-                inside = hold_steps < J  # a hold may not run past the end of the window
-                hold_hits = hit[:, jnp.clip(hold_steps, 0, J - 1)]  # (T, J, dwell_steps)
-                return jnp.all(hold_hits & inside, axis=-1)
+            if rest_at_end:
+                # rest[t, j]: step j moves with the velocity of sample t's last waypoint
+                rest = jnp.linalg.norm(goal_velocity[:, None] - achieved_vel[None], axis=-1)
+                rest = rest <= rest_speed
+            else:
+                rest = jnp.ones((T, J), dtype=bool)
 
             def reach(
                 reached_at: jax.Array, xs: tuple[jax.Array, jax.Array]
             ) -> tuple[jax.Array, None]:
-                """First step from `reached_at` within radius of the waypoint (held if last)."""
+                """First step from `reached_at` within radius of the waypoint (at rest if last)."""
                 waypoint, is_last = xs
                 hit = alive & (
                     jnp.linalg.norm(waypoint[:, None] - achieved[None], axis=-1) <= radius
                 )
-                hit = jnp.where(is_last, held(hit), hit)
+                hit = jnp.where(is_last, hit & rest, hit)
                 reached_at = jnp.min(
                     jnp.where(hit & (j[None, :] >= reached_at[:, None]), j[None, :], big), axis=1
                 )
@@ -197,8 +205,7 @@ def make_relabel_fn(
             reached_at, _ = jax.lax.scan(reach, t, (waypoints, is_last))
 
             is_event = reached_at < big
-            # Reached at the end of the hold, the step at which the env completes the sequence
-            tau = jnp.clip(jnp.where(is_event, reached_at + dwell_steps - 1 - t, 0), 0, window)
+            tau = jnp.clip(jnp.where(is_event, reached_at - t, 0), 0, window)
             censor = jnp.full((T,), window, dtype=jnp.int32)
 
         else:
@@ -249,11 +256,11 @@ def make_relabel_fn(
             "observation": jnp.concatenate(
                 [
                     transitions["observation"][:T, :state_dim],
-                    goal if waypoints_or_dwell else point_goal,
+                    goal if waypoints_or_rest else point_goal,
                 ],
                 axis=-1,
             ),
-            "goal": goal,
+            "goal": jnp.concatenate([goal, goal_velocity], axis=-1) if rest_at_end else goal,
             "action": action,
             "valid": jnp.all(chunk_ok, axis=1).astype(jnp.float32),
             "is_event": is_event.astype(jnp.float32),
