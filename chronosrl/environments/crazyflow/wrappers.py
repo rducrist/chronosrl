@@ -135,7 +135,6 @@ class EvalWrapper(Wrapper):
         metrics = {
             "time_at_goal": jnp.mean(episode["success"]),
             "goal_reached": jnp.mean(episode["success"] > 0),
-            "time_at_goal_rest": jnp.mean(episode["rest_success"]),
             "goal_error": jnp.mean(episode["goal_error"] / jnp.maximum(steps, 1.0)),
             "episode_length": jnp.mean(steps),
             "sequence_completed": jnp.mean(completed),

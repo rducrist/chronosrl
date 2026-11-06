@@ -54,13 +54,9 @@ def make_relabel_fn(
     probabilities = probabilities / jnp.sum(probabilities)
 
     nr_waypoints = getattr(env, "nr_waypoints", 1)
-    rest_at_end = getattr(env, "rest_at_end", False)
-    waypoints_or_rest = nr_waypoints > 1 or rest_at_end
-    assert not waypoints_or_rest or m == 1, "waypoints and rest need goal_sequence_length = 1"
-    assert not waypoints_or_rest or cost_weight == 0.0, "waypoints and rest need cost_weight = 0"
-    if rest_at_end:
-        vel_start, vel_end = env.velocity_indices
-        rest_speed = env.rest_speed
+    has_waypoints = nr_waypoints > 1
+
+    assert not has_waypoints or cost_weight == 0.0, "waypoints need cost_weight = 0"
 
     def relabel(transitions: dict[str, jax.Array], key: jax.Array) -> dict[str, jax.Array]:
         """Relabels one window of transitions with hindsight goals and hitting times.
@@ -82,8 +78,6 @@ def make_relabel_fn(
         j = jnp.arange(J)
         t = jnp.arange(T)
         achieved = transitions["observation"][:, goal_start:goal_end]
-        if rest_at_end:
-            achieved_vel = transitions["observation"][:, vel_start:vel_end]
         seed = transitions["seed"].astype(jnp.int32)
         same_episode = seed[:T, None] == seed[None, :]
         dt = j[None, :] - t[:, None]
@@ -100,11 +94,11 @@ def make_relabel_fn(
                 len(starts), m * goal_size
             )
 
-        if waypoints_or_rest:
+        if has_waypoints:
             # Goals are K waypoints visited in order. Only the first k are left to visit,
             # the rest repeat the last one, as in the env after reaching the goals
             key_strategy, key_future, key_random, key_remaining = jax.random.split(key, 4)
-            future = same_episode & (dt >= 1)
+            future = same_episode & (dt >= 1) & sequence_start[None, :]
 
             future_logits = jnp.log(
                 jnp.where(future, jnp.power(config.future_goal_gamma, dt.astype(jnp.float32)), 0.0)
@@ -113,7 +107,6 @@ def make_relabel_fn(
             # 0 = K sorted future steps of the same episode
             # 1 = the current step
             # 2 = K random steps of the window
-
             future_index = jnp.sort(
                 jax.random.categorical(
                     key_future, future_logits, axis=1, shape=(nr_waypoints, T)
@@ -135,11 +128,13 @@ def make_relabel_fn(
                 index,
                 index[t, remaining - 1][:, None],
             )
-            goal = achieved[index].reshape(T, nr_waypoints * goal_size)
-            point_goal = goal[:, :goal_size]
-            if rest_at_end:
-                # The velocity the drone had at the last waypoint, (T, 3)
-                goal_velocity = achieved_vel[index[:, -1]]
+            waypoint_goal = achieved[index].reshape(T, nr_waypoints * goal_size)
+            # consecutive waypoints achieved from the last waypoint
+            tail = sequences(index[:, -1])
+            goal = jnp.concatenate(
+                [waypoint_goal[:, : (nr_waypoints - 1) * goal_size], tail], axis=-1
+            )
+            point_goal = waypoint_goal[:, :goal_size]
 
         else:
             # Goal strategies: 0 = future goal of the same episode (geometric in dt),
@@ -173,34 +168,37 @@ def make_relabel_fn(
         # match[t, s]: the goal of sample t is matched by the achieved sequence starting at s
 
         big = jnp.iinfo(jnp.int32).max  # Sentinel for "not reached"
-        if waypoints_or_rest:
+        if has_waypoints:
             # Waypoints are reached in order: each one at its first hit or after the hit of
             # the previous one, starting from the anchor, so padded repeats cost no time
             alive = same_episode & (dt >= 0)
 
-            if rest_at_end:
-                # rest[t, j]: step j moves with the velocity of sample t's last waypoint
-                rest = jnp.linalg.norm(goal_velocity[:, None] - achieved_vel[None], axis=-1)
-                rest = rest <= rest_speed
-            else:
-                rest = jnp.ones((T, J), dtype=bool)
+            candidates = sequences(t).reshape(
+                T, m, goal_size
+            )  # achieved sequences starting at s < T
+            tail_match = jnp.all(
+                jnp.linalg.norm(tail.reshape(T, m, goal_size)[:, None] - candidates[None], axis=-1)
+                <= radius,
+                axis=-1,
+            )
 
-            def reach(
-                reached_at: jax.Array, xs: tuple[jax.Array, jax.Array]
-            ) -> tuple[jax.Array, None]:
-                """First step from `reached_at` within radius of the waypoint (at rest if last)."""
+            # Starts s>= T cannot hold m steps inside the window
+            tail_match = jnp.pad(tail_match, ((0, 0), (0, J - T)))
+
+            def reach(reached_at: jax.Array, xs: jax.Array) -> tuple[jax.Array, None]:
+                """First step from `reached_at` within radius of the waypoint."""
                 waypoint, is_last = xs
                 hit = alive & (
                     jnp.linalg.norm(waypoint[:, None] - achieved[None], axis=-1) <= radius
                 )
-                hit = jnp.where(is_last, hit & rest, hit)
+                hit = jnp.where(is_last, alive & tail_match, hit)
                 reached_at = jnp.min(
                     jnp.where(hit & (j[None, :] >= reached_at[:, None]), j[None, :], big), axis=1
                 )
                 return reached_at, None
 
             # Scan over the waypoints, (K, T, goal_size)
-            waypoints = goal.reshape(T, nr_waypoints, goal_size).swapaxes(0, 1)
+            waypoints = waypoint_goal.reshape(T, nr_waypoints, goal_size).swapaxes(0, 1)
             is_last = jnp.arange(nr_waypoints) == nr_waypoints - 1
             reached_at, _ = jax.lax.scan(reach, t, (waypoints, is_last))
 
@@ -256,11 +254,11 @@ def make_relabel_fn(
             "observation": jnp.concatenate(
                 [
                     transitions["observation"][:T, :state_dim],
-                    goal if waypoints_or_rest else point_goal,
+                    waypoint_goal if has_waypoints else point_goal,
                 ],
                 axis=-1,
             ),
-            "goal": jnp.concatenate([goal, goal_velocity], axis=-1) if rest_at_end else goal,
+            "goal": goal,
             "action": action,
             "valid": jnp.all(chunk_ok, axis=1).astype(jnp.float32),
             "is_event": is_event.astype(jnp.float32),

@@ -25,7 +25,7 @@ from chronosrl.environments import get_environment
 from chronosrl.networks import Policy
 
 
-#region Crazyflow
+# region Crazyflow
 @dataclass
 class Episode:
     """One rolled-out crazyflow episode in a single world."""
@@ -189,7 +189,7 @@ def rollout_crazyflow(
     """
     from ml_collections import config_dict
 
-    from chronosrl.environments.crazyflow import make_env
+    from chronosrl.environments.crazyflow import eval_config, make_env
     from chronosrl.environments.crazyflow.wrappers import Wrapper
 
     output = args.output or run / f"rollout{epoch_suffix(args)}_seed{args.seed}.json"
@@ -202,10 +202,8 @@ def rollout_crazyflow(
     # Runs from before goal sequences have neither key, early goal sequence runs use nr_goals
     if "nr_waypoints" not in env_config.task:
         env_config.task.nr_waypoints = env_config.task.get("nr_goals", 1)
-    if "rest_at_end" not in env_config.task:
-        env_config.task.rest_at_end = False
     # The wrappers the config enables set the action size the policy was trained with
-    env = make_env(env_config, nr_envs=1)
+    env = make_env(eval_config(env_config), nr_envs=1)
     if args.goal_cell is not None:
         # Only this cell as goal: spawn reads goal_xy when reset/step are traced
         maze = env
@@ -273,7 +271,7 @@ def pendulum_frame(
     return np.asarray(image)
 
 
-#region Pendulum
+# region Pendulum
 def rollout_pendulum(
     args: argparse.Namespace, run: Path, config: dict[str, Any], checkpoint: dict[str, Any]
 ) -> None:

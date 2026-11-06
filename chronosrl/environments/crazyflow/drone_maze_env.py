@@ -28,6 +28,7 @@ class DroneMazeEnv(DroneEnv):
             nr_envs: Number of parallel worlds, one drone each.
         """
         super().__init__(config, nr_envs)
+        assert self.nr_waypoints == 1, "the maze env samples a single goal cell"
 
         layout = LAYOUTS[config.maze.layout]
         s = self.scaling = config.maze.scaling
@@ -75,12 +76,12 @@ class DroneMazeEnv(DroneEnv):
 
         Args:
             data: Simulator data of all worlds.
-            goal: Current ``(n, 3)`` goals, kept where ``mask`` is False. Unused if no ``mask``.
+            goal: Current ``(n, 1, 3)`` goals, kept where ``mask`` is False. Unused if no ``mask``.
             key: PRNG key.
             mask: ``(n,)`` boolean array of worlds to respawn, or None to respawn all of them.
 
         Returns:
-            The updated simulator data and ``(n, 3)`` goals.
+            The updated simulator data and ``(n, 1, 3)`` goals.
         """
         keys = jax.random.split(key, 7)
         n = self.nr_envs
@@ -102,7 +103,7 @@ class DroneMazeEnv(DroneEnv):
             return jnp.concatenate([xy, z], axis=-1)  # (n, 3)
 
         pos = sample(*keys[:3], self.spawn_xy, self.spawn_low[2], self.spawn_high[2])[:, None]
-        new_goal = sample(*keys[3:6], self.goal_xy, self.goal_low[2], self.goal_high[2])
+        new_goal = sample(*keys[3:6], self.goal_xy, self.goal_low[2], self.goal_high[2])[:, None]
         vel = jax.random.uniform(
             keys[6], (n, 1, 3), minval=-self.max_spawn_speed, maxval=self.max_spawn_speed
         )
@@ -113,7 +114,7 @@ class DroneMazeEnv(DroneEnv):
             spawn_state["rotor_vel"] = jnp.full((self.nr_envs, 1, 4), self.hover_rotor_vel)
         data = data.replace(states=leaf_replace(data.states, mask, **spawn_state))
 
-        goal = new_goal if mask is None else jnp.where(mask[:, None], new_goal, goal)
+        goal = new_goal if mask is None else jnp.where(mask[:, None, None], new_goal, goal)
 
         return data, goal
 

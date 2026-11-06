@@ -37,7 +37,6 @@ class DroneEnv:
     """
 
     state_dim, observation_size, action_size, goal_indices = 18, 21, 4, (0, 3)
-    velocity_indices = (12, 15)  # the drone velocity, the rest condition of the last waypoint
 
     def __init__(self, config: config_dict.ConfigDict, nr_envs: int):
         """Build the batched simulator and precompute the action, bound and spawn ranges.
@@ -49,12 +48,10 @@ class DroneEnv:
         assert config.sim_freq % config.freq == 0, "sim_freq must be a multiple of freq"
         self.nr_envs = nr_envs
         self.nr_waypoints = config.task.nr_waypoints
-        self.rest_at_end = config.task.rest_at_end
         self.observation_size = self.state_dim + self.nr_waypoints * 3
 
         self.episode_length = config.episode_length
         self.goal_radius = config.task.goal_radius
-        self.rest_speed = config.task.rest_speed
         self.n_substeps = config.sim_freq // config.freq
 
         self.sim = Sim(
@@ -89,8 +86,10 @@ class DroneEnv:
 
         self.spawn_low = jnp.array(config.spawn.low)
         self.spawn_high = jnp.array(config.spawn.high)
-        self.goal_low = jnp.array(config.goal.low)
-        self.goal_high = jnp.array(config.goal.high)
+        # The track env samples goals around nominal waypoints and has no goal box
+        if "low" in config.goal:
+            self.goal_low = jnp.array(config.goal.low)
+            self.goal_high = jnp.array(config.goal.high)
         self.max_spawn_speed = config.spawn.max_speed
 
         # Spawn with rotors already at hover
@@ -134,21 +133,28 @@ class DroneEnv:
             axis=-1,
         ).astype(jnp.float32)
 
+    def sample_goals(self, key: jax.Array) -> jax.Array:
+        """Sample ``(n, K, 3)`` waypoint goals uniformly from the goal box."""
+        return jax.random.uniform(
+            key, (self.nr_envs, self.nr_waypoints, 3), minval=self.goal_low, maxval=self.goal_high
+        )
+
     def spawn(
         self, data: SimData, goal: jax.Array | None, key: jax.Array, mask: jax.Array | None = None
     ) -> tuple[SimData, jax.Array]:
         """Respawn the worlds in ``mask`` at a random position and velocity with a new goal.
 
-        Positions, goals and velocity components are sampled uniformly from the configured boxes.
+        Positions and velocity components are sampled uniformly from the configured boxes, goals
+        come from ``sample_goals``.
 
         Args:
             data: Simulator data of all worlds.
-            goal: Current ``(n, 3)`` goals, kept where ``mask`` is False. Unused if no ``mask``.
+            goal: Current ``(n, K, 3)`` goals, kept where ``mask`` is False. Unused if no ``mask``.
             key: PRNG key.
             mask: ``(n,)`` boolean array of worlds to respawn, or None to respawn all of them.
 
         Returns:
-            The updated simulator data and ``(n, 3)`` goals.
+            The updated simulator data and ``(n, K, 3)`` goals.
         """
         # Handles the randomization of goal and position
         pos_key, vel_key, goal_key = jax.random.split(key, 3)
@@ -157,12 +163,8 @@ class DroneEnv:
         vel = jax.random.uniform(
             vel_key, shape, minval=-self.max_spawn_speed, maxval=self.max_spawn_speed
         )
-        new_goal = jax.random.uniform(
-            goal_key,
-            (self.nr_envs, self.nr_waypoints, 3),
-            minval=self.goal_low,
-            maxval=self.goal_high,
-        )
+
+        new_goal = self.sample_goals(goal_key)
 
         data = self.sim._reset(data, self.sim.default_data, mask)
         spawn_state = {"pos": pos, "vel": vel}
@@ -235,11 +237,7 @@ class DroneEnv:
 
         progress = state.info["progress"]
         at_goal = jnp.linalg.norm(pos - state.goal[:, 0], axis=-1) < self.goal_radius
-        last = progress == self.nr_waypoints - 1
-        # With rest_at_end the last waypoint also needs the drone at rest
-        at_rest = jnp.linalg.norm(vel, axis=-1) < self.rest_speed
-        arrived = at_goal & (at_rest | ~last) if self.rest_at_end else at_goal
-        passed = arrived & (progress < self.nr_waypoints)
+        passed = at_goal & (progress < self.nr_waypoints)
         popped = jnp.concatenate([state.goal[:, 1:], state.goal[:, -1:]], axis=1)
         goal = jnp.where(passed[:, None, None], popped, state.goal)
         progress = progress + passed
@@ -278,16 +276,9 @@ class DroneEnv:
     ) -> dict[str, jax.Array]:
         """Per-world metrics for a single step.
 
-        ``success``: within ``goal_radius`` of the goal. ``rest_success``: additionally slower than
-        ``rest_speed``. ``goal_error``: distance to the goal.
+        ``success``: within ``goal_radius`` of the goal. ``goal_error``: distance to the goal.
         """
         distance = jnp.linalg.norm(goal - pos, axis=-1)
-        speed = jnp.linalg.norm(vel, axis=-1)
         at_goal = distance < self.goal_radius
-        at_rest = speed < self.rest_speed
 
-        return {
-            "success": at_goal.astype(jnp.float32),
-            "rest_success": (at_goal & at_rest).astype(jnp.float32),
-            "goal_error": distance,
-        }
+        return {"success": at_goal.astype(jnp.float32), "goal_error": distance}
