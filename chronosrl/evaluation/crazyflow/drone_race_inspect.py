@@ -56,7 +56,8 @@ def rollout(
             "vel": state.data.states.vel[:, 0],
             "done": next_state.done,
             "truncation": next_state.info["truncation"],
-            "reached": next_state.metrics["waypoint_reached"],  # measured before the autoreset
+            # Within goal_radius of the goal being chased, measured before the autoreset
+            "reached": next_state.metrics["success"],
         }
         return (next_state, key), output
 
@@ -98,7 +99,6 @@ def analyse(
     trajectory: dict[str, np.ndarray],
     task: dict[str, np.ndarray],
     gate: int,
-    centre_waypoint: int,
     bounds: tuple[np.ndarray, np.ndarray],
     dt: float,
 ) -> tuple[dict[str, Any], np.ndarray]:
@@ -159,9 +159,7 @@ def analyse(
     summary = {
         "episodes": n,
         "mean_length": float(np.mean(last + 1)),
-        "reached_gate_centre": float(
-            np.mean(np.any(trajectory["reached"][..., centre_waypoint] * alive > 0, axis=0))
-        ),
+        "reached_gate_centre": float(np.mean(np.any(trajectory["reached"] * alive > 0, axis=0))),
         "closest_to_centre_m": {
             "median": float(np.median(np.min(distance, axis=0))),
             "p10": float(np.percentile(np.min(distance, axis=0), 10)),
@@ -258,10 +256,7 @@ def main() -> None:
             env, policy, params, args.episodes, config.episode_length, rollout_key, stochastic
         )
         gate = int(race.gate_sequence[0])
-        centre_waypoint = 0 if race.centres_only else 1
-        summary, approaching = analyse(
-            trajectory, task, gate, centre_waypoint, bounds, 1.0 / config.freq
-        )
+        summary, approaching = analyse(trajectory, task, gate, bounds, 1.0 / config.freq)
         results[name] = summary
         if not stochastic:
             states = trajectory["obs"][approaching]

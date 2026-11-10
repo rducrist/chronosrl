@@ -163,8 +163,4 @@ class EvalWrapper(Wrapper):
             closest = jnp.mean(episode["waypoint_distance"], axis=0)  # (K,), mean over worlds
             for k in range(closest.shape[0]):
                 metrics[f"wp_distance_{k + 1}"] = closest[k]
-            # Share of episodes that reached each waypoint, in sequence order
-            reached = jnp.mean(episode["waypoint_reached"] > 0, axis=0)  # (K,)
-            for k in range(reached.shape[0]):
-                metrics[f"wp_reached_{k + 1}"] = reached[k]
         return metrics

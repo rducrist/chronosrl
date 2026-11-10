@@ -26,10 +26,9 @@ ASSETS = Path(__file__).parent / "assets"
 class DroneRaceEnv(DroneEnv):
     """Fly through the gates of a track in ``gate_order``, terminating on contact with the track.
 
-    Every gate pass in ``gate_order`` is three waypoints along the gate's normal (its local +x,
-    the lsy passing direction): an approach point ``waypoint_offset`` in front of the gate, the
-    centre and an exit point ``waypoint_offset`` behind it, so the drone crosses each gate along
-    its normal before turning. Each episode the gates and obstacles are moved by uniform noise
+    The goals are a sliding window over the gate centres in ``gate_order``: the next K centres,
+    advanced by one track centre whenever the first is reached and padded with the last centre
+    at the end of the track. Each episode the gates and obstacles are moved by uniform noise
     around their nominal poses, and the sampled track is the ``task``.
     """
 
@@ -46,11 +45,8 @@ class DroneRaceEnv(DroneEnv):
         track = config.track
         assert all(0 < g <= len(track.gates) for g in track.gate_order), "gate numbers are 1..G"
         self.nr_passes = len(track.gate_order)
-        self.centres_only = self.nr_waypoints == self.nr_passes  # no approach and exit points
-        assert self.centres_only or self.nr_waypoints == 3 * self.nr_passes, (
-            "one or three waypoints per gate_order entry"
-        )
-        self.waypoint_offset = track.get("waypoint_offset", 0.4)  # m, approach and exit distance
+        assert self.nr_waypoints <= self.nr_passes, "horizon longer than the track"
+        self.waypoint_offset = track.get("waypoint_offset", 0.4)  # m, gate spawns in front of it
 
         self.nominal_gates_pos = jnp.array([g["pos"] for g in track.gates])  # (G, 3)
         self.nominal_gates_rpy = jnp.array([g["rpy"] for g in track.gates])  # (G, 3)
@@ -104,17 +100,22 @@ class DroneRaceEnv(DroneEnv):
         return next_state.replace(obs=self.add_gates(next_state.obs, next_state.task))
 
     def policy_observation(self, obs: jax.Array) -> jax.Array:
-        """Goals and gate centres relative to the drone, gate normals, rotation and velocities."""
+        """Goals relative to the drone, rotation and velocities, and the normal of each goal's gate.
+
+        The gate of a goal is the one with the nearest centre, picked from the goals so it also
+        follows relabeled goals.
+        """
         n, batch = DroneEnv.state_dim, obs.shape[:-1]
         pos = obs[..., None, :3]
         gates = obs[..., n : self.state_dim].reshape(batch + (-1, 6))
         goals = obs[..., self.state_dim :].reshape(batch + (self.nr_waypoints, 3))
+        distance = jnp.linalg.norm(goals[..., :, None, :] - gates[..., None, :, :3], axis=-1)
+        near = jnp.take_along_axis(gates, jnp.argmin(distance, -1)[..., None], axis=-2)
         return jnp.concatenate(
             [
                 (pos - goals).reshape(batch + (-1,)),
                 obs[..., 3:n],
-                (pos - gates[..., :3]).reshape(batch + (-1,)),
-                gates[..., 3:].reshape(batch + (-1,)),
+                near[..., 3:].reshape(batch + (-1,)),
             ],
             axis=-1,
         )
@@ -127,14 +128,22 @@ class DroneRaceEnv(DroneEnv):
         offset = self.waypoint_offset * normal
         return jnp.stack([centre - offset, centre, centre + offset], axis=2)
 
-    def sample_task(self, key: jax.Array) -> tuple[jax.Array, dict]:
-        """Sample a noisy track and a start per world; the goals are the waypoints left from it.
+    def track_centres(self, task: dict) -> jax.Array:
+        """(n, P, 3) gate centres in gate_order."""
+        return task["gates_pos"][:, self.gate_sequence]
 
-        ``start = 0`` spawns on the platform with all waypoints ahead, ``j > 0`` spawns in the
-        centre of gate pass ``j - 1`` with its exit point and the passes ``j..`` ahead, padded with
-        the last waypoint. With ``spawn_at_gates``, a world starts on the platform with
-        ``platform_probability`` and otherwise in one of the passes ``0..P-2`` uniformly; without
-        it every world starts on the platform.
+    def first_waypoint(self, start: jax.Array) -> jax.Array:
+        """(n,) track index of the first goal: gate pass start - 1, or 0 on the platform."""
+        return jnp.maximum(start - 1, 0)
+
+    def sample_task(self, key: jax.Array) -> tuple[jax.Array, dict]:
+        """Sample a noisy track and a start per world; the goals are the next K centres from it.
+
+        ``start = 0`` spawns on the platform with the window at gate pass 0, ``j > 0`` spawns in
+        front of gate pass ``j - 1`` with the window at that pass, padded with the last centre.
+        With ``spawn_at_gates``, a world starts on the platform with ``platform_probability`` and
+        otherwise in front of one of the passes ``0..P-1`` uniformly; without it every world
+        starts on the platform.
 
         Returns:
             ``(n, K, 3)`` goals and the task: ``gates_pos`` ``(n, G, 3)``, ``gates_quat``
@@ -168,17 +177,20 @@ class DroneRaceEnv(DroneEnv):
             "start": start,
         }
         # Indexed by gate_order, so a gate passed twice is the same gate both times
-        K = self.nr_waypoints
-        waypoints = self.gate_waypoints(task)
-        if self.centres_only:
-            waypoints = waypoints[:, :, 1:2]
-        waypoints = waypoints.reshape(self.nr_envs, K, 3)
-        # A spawn in pass j - 1 sits at its centre, so the goals start at its exit point, or at
-        # the next centre without exit points
-        first = jnp.where(start > 0, start -1 if self.centres_only else 3 * start - 2, 0)
-        idx = jnp.minimum(jnp.arange(K)[None] + first[:, None], K - 1)  # (n, K)
-        goals = waypoints[jnp.arange(self.nr_envs)[:, None], idx]  # remaining waypoints, padded
+        first = self.first_waypoint(start)
+        idx = jnp.minimum(jnp.arange(self.nr_waypoints)[None] + first[:, None], self.nr_passes - 1)
+        goals = self.track_centres(task)[jnp.arange(self.nr_envs)[:, None], idx]  # (n, K, 3)
         return goals, task
+
+    def next_goal(self, goal: jax.Array, task: dict, progress: jax.Array) -> jax.Array:
+        """The track centre after the current window, or the last one once the track runs out."""
+        i = self.first_waypoint(task["start"]) + progress + self.nr_waypoints
+        i = jnp.minimum(i, self.nr_passes - 1)
+        return self.track_centres(task)[jnp.arange(self.nr_envs), i]
+
+    def sequence_length(self, task: dict) -> jax.Array:
+        """Gate passes left from spawn."""
+        return self.nr_passes - self.first_waypoint(task["start"])
 
     def spawn(
         self,
@@ -188,7 +200,9 @@ class DroneRaceEnv(DroneEnv):
         key: jax.Array,
         mask: jax.Array | None = None,
     ) -> tuple[SimData, jax.Array, dict]:
-        """Base spawn, then move the worlds with ``start > 0`` to the centre of pass ``start - 1``.
+        """Base spawn, then move the worlds with ``start > 0`` in front of pass ``start - 1``.
+
+        Gate spawns start ``waypoint_offset`` in front of the gate centre, on its normal.
 
         The base spawn samples the platform position from the spawn box and merges the new task
         by ``mask``, so ``task["start"]`` already belongs to the new episodes.

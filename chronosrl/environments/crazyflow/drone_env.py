@@ -215,7 +215,6 @@ class DroneEnv:
             metrics={
                 **self.evaluation_step_metrics(pos, vel, goal[:, 0], task),
                 "sequence_done": zeros,
-                "waypoint_reached": jnp.zeros((self.nr_envs, self.nr_waypoints), jnp.float32),
             },
         )
 
@@ -232,6 +231,14 @@ class DroneEnv:
         command = self.action_low + 0.5 * (action + 1.0) * (self.action_high - self.action_low)
         data = F.attitude_control(data, command[:, None, :])
         return self.sim._step(data, self.n_substeps)
+
+    def next_goal(self, goal: jax.Array, task: dict, progress: jax.Array) -> jax.Array:
+        """(n, 3) goal appended when the first goal is reached; repeats the last one."""
+        return goal[:, -1]
+
+    def sequence_length(self, task: dict) -> jax.Array:
+        """(n,) goals to reach before the sequence is done."""
+        return jnp.full(self.nr_envs, self.nr_waypoints)
 
     def step(self, state: State, action: jax.Array) -> State:
         """Advance one policy step and autoreset the worlds whose episode ended.
@@ -257,20 +264,18 @@ class DroneEnv:
         done = terminated | truncated
 
         progress = state.info["progress"]
+        length = self.sequence_length(state.task)
         at_goal = jnp.linalg.norm(pos - state.goal[:, 0], axis=-1) < self.goal_radius
-        passed = at_goal & (progress < self.nr_waypoints)
-        popped = jnp.concatenate([state.goal[:, 1:], state.goal[:, -1:]], axis=1)
+        passed = at_goal & (progress < length)
+        appended = self.next_goal(state.goal, state.task, progress)[:, None]
+        popped = jnp.concatenate([state.goal[:, 1:], appended], axis=1)
         goal = jnp.where(passed[:, None, None], popped, state.goal)
         progress = progress + passed
 
         # Measured before the autoreset, against the goal the drone was chasing
         metrics = {
             **self.evaluation_step_metrics(pos, vel, state.goal[:, 0], state.task),
-            "sequence_done": (progress >= self.nr_waypoints).astype(jnp.float32),
-            # (n, K), 1 from the step waypoint k is reached on
-            "waypoint_reached": (progress[:, None] > jnp.arange(self.nr_waypoints)).astype(
-                jnp.float32
-            ),
+            "sequence_done": (progress >= length).astype(jnp.float32),
         }
 
         # 3. Autoreset the envs that ended

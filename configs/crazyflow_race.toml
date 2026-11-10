@@ -53,8 +53,8 @@ max_delta = 0.2 # max change per policy step, in [-1, 1] action units
 [environment.task]
 goal_radius = 0.05 # training and relabeling, around the gate centre
 eval_goal_radius = 0.1 # eval and rollout only
-nr_waypoints = 12 # 3 per gate_order entry: approach, centre, exit
-spawn_at_gates = true # also spawn in the centre of gate j - 1 with its exit point and gates j.. left
+nr_waypoints = 2 # horizon: the next n gate centres
+spawn_at_gates = true # also spawn in front of gate pass j - 1, with the window starting at it
 eval_spawn_at_gates = false # eval and rollout start on the platform
 platform_probability = 0.5 # with spawn_at_gates: share of starts on the platform, the rest uniform over the gates
 spawn_speed = 0.0 # m/s, with spawn_at_gates: gate spawns start with a uniform speed up to this into the gate
@@ -70,14 +70,14 @@ low = [-1.5, 0.75, 0.01]
 high = [-1.5, 0.75, 0.01]
 max_speed = 0.0
 
-# Goals are the approach, centre and exit points of the gates in gate_order, there is no goal box
+# Goals are a sliding window over the gate centres in gate_order, there is no goal box
 [environment.goal]
 
 # The track of lsy_drone_racing config/level2.toml
 [environment.track]
 # 1-based gate numbers in the order they are flown; gate 2 is passed twice
 gate_order = [1, 2, 3, 4]
-waypoint_offset = 0.4 # m, approach and exit points in front of and behind each gate, along its normal
+waypoint_offset = 0.4 # m, gate spawns start this far in front of the gate, along its normal
 
 [[environment.track.gates]]
 pos = [0.5, 0.25, 0.7]
