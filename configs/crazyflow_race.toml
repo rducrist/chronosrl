@@ -1,0 +1,108 @@
+# Everything specific to the crazyflow_race experiment: the lsy drone racing level2 track.
+# Algorithm defaults live in chronosrl/algorithms/<name>.py; this file only overrides them.
+# CLI flags still win, e.g. --environment.task.goal_radius=0.1
+# Write floats with a decimal point: ConfigDict locks the type from the first value.
+
+
+[runner]
+exp_name = "crazyflow_race"
+checkpoint_every = 10 # keep checkpoints/epoch_<N>.pkl every N epochs (0: only the latest model.pkl)
+tag = ""
+
+# Applied to every algorithm
+[algorithm]
+action_chunk_length = 1
+cost_weight = 0.0
+goal_sequence_length = 1
+name = "srl"
+window = 1000
+total_timesteps = 50_000_000
+
+[environment]
+name = "crazyflow_race"
+seed = 1000
+nr_envs = 512
+nr_eval_envs = 100
+episode_length = 500
+freq = 50
+sim_freq = 500
+device = "gpu"
+drone = "cf21B_500"
+dynamics = "first_principles"
+reset_rotor = true
+
+[environment.randomization]
+enabled = false
+mass = 0.2            # fraction
+thrust_curve = 0.1    # fraction per motor and coefficient
+action_delay = 0.04   # s, max lag of the attitude command
+inertia = 0.2         # fraction per principal axis
+rotor_dynamics = 0.2  # fraction per motor and coefficient
+torque_curve = 0.1    # fraction per motor and coefficient
+force = 0.04          # N per axis, constant per episode (~10 % of hover thrust)
+torque = 0.0002       # Nm per axis, constant per episode
+force_noise = 0.05    # N std per sim step
+torque_noise = 0.001  # Nm std per sim step
+
+[environment.action]
+max_angle = 0.5236 # rad, limit for roll/pitch/yaw commands
+zero_yaw = true # hold the yaw command at 0, the policy outputs [roll, pitch, thrust]
+delta = true # the policy outputs a change to the last action
+max_delta = 0.2 # max change per policy step, in [-1, 1] action units
+
+[environment.task]
+goal_radius = 0.05 # training and relabeling, around the gate centre
+eval_goal_radius = 0.1 # eval and rollout only
+nr_waypoints = 12 # 3 per gate_order entry: approach, centre, exit
+spawn_at_gates = true # also spawn in the centre of gate j - 1 with its exit point and gates j.. left
+eval_spawn_at_gates = false # eval and rollout start on the platform
+platform_probability = 0.5 # with spawn_at_gates: share of starts on the platform, the rest uniform over the gates
+spawn_speed = 0.0 # m/s, with spawn_at_gates: gate spawns start with a uniform speed up to this into the gate
+
+# Episodes terminate when the drone leaves this box (the lsy pos limits) or touches the track
+[environment.bounds]
+low = [-3.0, -3.0, 0.0]
+high = [3.0, 3.0, 2.5]
+
+# The level2 drone start, fixed
+[environment.spawn]
+low = [-1.5, 0.75, 0.01]
+high = [-1.5, 0.75, 0.01]
+max_speed = 0.0
+
+# Goals are the approach, centre and exit points of the gates in gate_order, there is no goal box
+[environment.goal]
+
+# The track of lsy_drone_racing config/level2.toml
+[environment.track]
+# 1-based gate numbers in the order they are flown; gate 2 is passed twice
+gate_order = [1, 2, 3, 4]
+waypoint_offset = 0.4 # m, approach and exit points in front of and behind each gate, along its normal
+
+[[environment.track.gates]]
+pos = [0.5, 0.25, 0.7]
+rpy = [0.0, 0.0, -0.78]
+[[environment.track.gates]]
+pos = [1.05, 0.75, 1.2]
+rpy = [0.0, 0.0, 2.35]
+[[environment.track.gates]]
+pos = [-1.0, -0.25, 0.7]
+rpy = [0.0, 0.0, 3.14]
+[[environment.track.gates]]
+pos = [0.0, -0.75, 1.2]
+rpy = [0.0, 0.0, 0.0]
+
+[[environment.track.obstacles]]
+pos = [0.0, 0.75, -1.55]
+[[environment.track.obstacles]]
+pos = [1.0, 0.25, -1.55]
+[[environment.track.obstacles]]
+pos = [-1.5, -0.25, -1.55]
+[[environment.track.obstacles]]
+pos = [-0.5, -0.75, -1.55]
+
+# Uniform noise half-widths per axis, the level2 randomizations
+[environment.track.noise]
+gate_pos = [0.15, 0.15, 0.1]     # m
+gate_rpy = [0.05, 0.1, 0.2]      # rad
+obstacle_pos = [0.15, 0.15, 0.05] # m

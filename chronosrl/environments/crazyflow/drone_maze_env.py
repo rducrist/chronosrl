@@ -54,20 +54,25 @@ class DroneMazeEnv(DroneEnv):
         idx = jnp.clip(idx, 0, jnp.array(self.walls.shape) - 1)
         return self.walls[idx[:, 0], idx[:, 1]]  # (n,) bool
 
-    def terminated(self, pos: jax.Array, vel: jax.Array) -> jax.Array:
+    def terminated(self, data: SimData, task: dict) -> jax.Array:
         """Base termination plus hitting a wall."""
-        return super().terminated(pos, vel) | self.in_wall(pos)
+        return super().terminated(data, task) | self.in_wall(data.states.pos[:, 0])
 
     def evaluation_step_metrics(
-        self, pos: jax.Array, vel: jax.Array, goal: jax.Array
+        self, pos: jax.Array, vel: jax.Array, goal: jax.Array, task: dict
     ) -> dict[str, jax.Array]:
         """Base metrics plus ``crashed``: the drone is inside a wall cell."""
-        metrics = super().evaluation_step_metrics(pos, vel, goal)
+        metrics = super().evaluation_step_metrics(pos, vel, goal, task)
         return {**metrics, "crashed": self.in_wall(pos).astype(jnp.float32)}
 
     def spawn(
-        self, data: SimData, goal: jax.Array | None, key: jax.Array, mask: jax.Array | None = None
-    ) -> tuple[SimData, jax.Array]:
+        self,
+        data: SimData,
+        goal: jax.Array | None,
+        task: dict | None,
+        key: jax.Array,
+        mask: jax.Array | None = None,
+    ) -> tuple[SimData, jax.Array, dict]:
         """Respawn the worlds in ``mask`` in a random spawn cell with a goal in a random goal cell.
 
         Positions and goals get a uniform xy offset of at most ``spawn_noise`` from the cell centre,
@@ -77,11 +82,12 @@ class DroneMazeEnv(DroneEnv):
         Args:
             data: Simulator data of all worlds.
             goal: Current ``(n, 1, 3)`` goals, kept where ``mask`` is False. Unused if no ``mask``.
+            task: Unused, the maze has no per-episode task data.
             key: PRNG key.
             mask: ``(n,)`` boolean array of worlds to respawn, or None to respawn all of them.
 
         Returns:
-            The updated simulator data and ``(n, 1, 3)`` goals.
+            The updated simulator data, ``(n, 1, 3)`` goals and an empty task.
         """
         keys = jax.random.split(key, 7)
         n = self.nr_envs
@@ -116,7 +122,7 @@ class DroneMazeEnv(DroneEnv):
 
         goal = new_goal if mask is None else jnp.where(mask[:, None, None], new_goal, goal)
 
-        return data, goal
+        return data, goal, {}
 
     def policy_observation(self, obs: jax.Array) -> jax.Array:
         """Turn ``(..., 21)`` observations into ``(..., 21)`` policy inputs."""

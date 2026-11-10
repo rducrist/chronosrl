@@ -5,6 +5,7 @@ from ml_collections import config_dict
 from chronosrl.config import default_config_path, load_toml
 from chronosrl.environments.crazyflow.drone_env import DroneEnv
 from chronosrl.environments.crazyflow.drone_maze_env import DroneMazeEnv
+from chronosrl.environments.crazyflow.drone_race_env import DroneRaceEnv
 from chronosrl.environments.crazyflow.drone_track_env import DroneTrackEnv
 from chronosrl.environments.crazyflow.wrappers import DeltaActions, EvalWrapper, Wrapper, ZeroYaw
 
@@ -13,6 +14,7 @@ ENVS = {
     "crazyflow_position": DroneEnv,
     "crazyflow_maze": DroneMazeEnv,
     "crazyflow_track": DroneTrackEnv,
+    "crazyflow_race": DroneRaceEnv,
 }
 
 
@@ -36,9 +38,15 @@ def make_env(config: config_dict.ConfigDict, nr_envs: int) -> DroneEnv | Wrapper
 
 
 def eval_config(config: config_dict.ConfigDict) -> config_dict.ConfigDict:
-    """Copy of the env ``config`` with ``task.eval_goal_radius`` as the goal radius, if set."""
+    """Copy of the env ``config`` with the ``task.eval_*`` values in place of their training ones.
+
+    ``eval_goal_radius`` replaces ``goal_radius``, ``eval_spawn_at_gates`` replaces
+    ``spawn_at_gates``; each only if set.
+    """
     config = config.copy_and_resolve_references()
     config.task.goal_radius = config.task.get("eval_goal_radius", config.task.goal_radius)
+    if "eval_spawn_at_gates" in config.task:
+        config.task.spawn_at_gates = config.task.eval_spawn_at_gates
     return config
 
 

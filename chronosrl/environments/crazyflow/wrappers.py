@@ -91,16 +91,21 @@ class EvalWrapper(Wrapper):
     """Accumulates per-episode metrics on top of an env for evaluation.
 
     Only the first episode of each world is counted: ``active_episodes`` drops to 0 once it ends.
+    Step metrics are summed over the episode, except those in ``MIN_METRICS``, which keep their
+    minimum.
     """
 
+    MIN_METRICS = ("waypoint_distance",)
+
     def reset(self, keys: jax.Array) -> State:
-        """Reset the env and zero the episode accumulators in ``info``."""
+        """Reset the env and initialize the episode accumulators in ``info``."""
         state = self.env.reset(keys)
         return state.replace(
             info={
                 **state.info,
                 "episode_metrics": {
-                    name: jnp.zeros_like(value) for name, value in state.metrics.items()
+                    name: jnp.full_like(value, jnp.inf if name in self.MIN_METRICS else 0.0)
+                    for name, value in state.metrics.items()
                 },
                 "active_episodes": jnp.ones_like(state.done),
                 "episode_steps": jnp.zeros_like(state.done),
@@ -111,11 +116,19 @@ class EvalWrapper(Wrapper):
         """Step the env and add the step metrics to the episodes that are still active."""
         next_state = self.env.step(state, action)
         active = state.info["active_episodes"]
+
+        def accumulate(name: str, total: jax.Array, value: jax.Array) -> jax.Array:
+            # Per-world metrics may have trailing axes, e.g. (n, K) waypoint distances
+            mask = active.reshape(active.shape + (1,) * (value.ndim - 1))
+            if name in self.MIN_METRICS:
+                return jnp.where(mask > 0, jnp.minimum(total, value), total)
+            return total + value * mask
+
         return next_state.replace(
             info={
                 **next_state.info,
                 "episode_metrics": {
-                    name: state.info["episode_metrics"][name] + value * active
+                    name: accumulate(name, state.info["episode_metrics"][name], value)
                     for name, value in next_state.metrics.items()
                 },
                 "active_episodes": active * (1.0 - next_state.done),
@@ -144,4 +157,14 @@ class EvalWrapper(Wrapper):
         # Only the maze env reports wall crashes
         if "crashed" in episode:
             metrics["crash_rate"] = jnp.mean(episode["crashed"] > 0)
+        # Race envs: the closest approach to each gate replaces reaching and staying at a goal
+        if "waypoint_distance" in episode:
+            del metrics["time_at_goal"], metrics["goal_reached"]
+            closest = jnp.mean(episode["waypoint_distance"], axis=0)  # (K,), mean over worlds
+            for k in range(closest.shape[0]):
+                metrics[f"wp_distance_{k + 1}"] = closest[k]
+            # Share of episodes that reached each waypoint, in sequence order
+            reached = jnp.mean(episode["waypoint_reached"] > 0, axis=0)  # (K,)
+            for k in range(reached.shape[0]):
+                metrics[f"wp_reached_{k + 1}"] = reached[k]
         return metrics

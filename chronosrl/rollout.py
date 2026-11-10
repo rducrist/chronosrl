@@ -30,7 +30,8 @@ from chronosrl.networks import Policy
 class Episode:
     """One rolled-out crazyflow episode in a single world."""
 
-    frames: list[tuple[Any, np.ndarray, int]]  # (sim data, goals (K, 3), goals reached) per step
+    # (sim data, goals (K, 3), goals reached, task) per step; the task is the race track, or {}
+    frames: list[tuple[Any, np.ndarray, int, dict]]
     successes: list[float] = field(default_factory=list)
     errors: list[float] = field(default_factory=list)
     sequence_done: list[float] = field(default_factory=list)
@@ -59,7 +60,8 @@ def run_episode(
     """Spawn a single world from ``key`` and roll out one episode of at most ``max_steps``."""
     state = reset(key[None])
     goals = np.asarray(state.goal[0])  # (K, 3), the whole sequence before any goal is reached
-    episode = Episode(frames=[(state.data, goals, 0)])
+    task = state.task  # constant over the episode
+    episode = Episode(frames=[(state.data, goals, 0, task)])
     for index in range(max_steps):
         # Query the policy once per chunk and execute the chunk's actions open-loop.
         if index % chunk_length == 0:
@@ -72,7 +74,7 @@ def run_episode(
             # Same-step autoreset returns a different episode: omit that frame.
             episode.crashed = not bool(state.info["truncation"][0])
             break
-        episode.frames.append((state.data, goals, int(state.info["progress"][0])))
+        episode.frames.append((state.data, goals, int(state.info["progress"][0]), task))
     return episode
 
 
@@ -106,9 +108,9 @@ def summarize(episodes: list[Episode]) -> dict[str, Any]:
 
 
 def play(
-    env: Any, frames: list[tuple[Any, np.ndarray, int]], dt: float, fps: float, loop: bool
+    env: Any, frames: list[tuple[Any, np.ndarray, int, dict]], dt: float, fps: float, loop: bool
 ) -> None:
-    """Replay ``(sim data, goals, goals reached)`` frames, ``dt`` s apart, in the MuJoCo viewer."""
+    """Replay ``(sim data, goals, goals reached, task)`` frames, ``dt`` s apart, in the viewer."""
     import glfw
     import mujoco
 
@@ -131,6 +133,11 @@ def play(
             "distance": 1.2 * max(rows, cols) * env.scaling,
             "elevation": -60.0,
         }
+    # Race envs: the gates and obstacles are mocap bodies, moved to each episode's track
+    race = hasattr(env, "place_track")
+    if race:
+        # The lsy drone racing world view
+        cam_config = {"lookat": np.zeros(3), "distance": 5.0, "azimuth": 180.0, "elevation": -25.0}
     frame_count = int(np.ceil((len(frames) - 1) * dt * fps)) + 1
     while True:
         started = time.perf_counter()
@@ -140,8 +147,11 @@ def play(
                 window = viewer.viewer.window
                 if window is None or glfw.window_should_close(window):
                     return
-            data, goals, progress = frames[min(int(index / (fps * dt)), len(frames) - 1)]
+            data, goals, progress, task = frames[min(int(index / (fps * dt)), len(frames) - 1)]
             env.sim.data = data
+            if race:
+                # render syncs only the drone into mjx_data, the track stays where it is placed
+                env.sim.mjx_data = env.place_track(env.sim.mjx_data, task)
             if viewer is not None:
                 # The viewer clears markers after every render, so re-add the goals each frame.
                 # Reached goals green, the current one red, the later ones faded orange

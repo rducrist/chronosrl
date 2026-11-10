@@ -21,11 +21,13 @@ class State:
     data: SimData
     obs: jax.Array  # (n, observation_size) = [drone state, goal]
     goal: jax.Array  # (n,3)
+    task: dict  # per-episode constants of each world, e.g. a race track; empty for this task
     reward: jax.Array  # (n, )
     key: jax.Array  # single PRNG key, split on every step for autoresets
     done: jax.Array  # (n, )
     info: dict  # seed (episode id), steps since reset, truncation
     metrics: dict
+    task: dict  # needed for the drone racing env
 
 
 class DroneEnv:
@@ -49,6 +51,7 @@ class DroneEnv:
         self.nr_envs = nr_envs
         self.nr_waypoints = config.task.nr_waypoints
         self.observation_size = self.state_dim + self.nr_waypoints * 3
+
 
         self.episode_length = config.episode_length
         self.goal_radius = config.task.goal_radius
@@ -133,28 +136,35 @@ class DroneEnv:
             axis=-1,
         ).astype(jnp.float32)
 
-    def sample_goals(self, key: jax.Array) -> jax.Array:
-        """Sample ``(n, K, 3)`` waypoint goals uniformly from the goal box."""
-        return jax.random.uniform(
+    def sample_task(self, key: jax.Array) -> tuple[jax.Array, dict]:
+        """Sample ``(n, K, 3)`` waypoint goals uniformly from the goal box, with an empty task."""
+        goal = jax.random.uniform(
             key, (self.nr_envs, self.nr_waypoints, 3), minval=self.goal_low, maxval=self.goal_high
         )
+        return goal, {}
 
     def spawn(
-        self, data: SimData, goal: jax.Array | None, key: jax.Array, mask: jax.Array | None = None
-    ) -> tuple[SimData, jax.Array]:
+        self,
+        data: SimData,
+        goal: jax.Array | None,
+        task: dict | None,
+        key: jax.Array,
+        mask: jax.Array | None = None,
+    ) -> tuple[SimData, jax.Array, dict]:
         """Respawn the worlds in ``mask`` at a random position and velocity with a new goal.
 
         Positions and velocity components are sampled uniformly from the configured boxes, goals
-        come from ``sample_goals``.
+        and the task come from ``sample_task``.
 
         Args:
             data: Simulator data of all worlds.
             goal: Current ``(n, K, 3)`` goals, kept where ``mask`` is False. Unused if no ``mask``.
+            task: Current task, kept where ``mask`` is False. Unused if no ``mask``.
             key: PRNG key.
             mask: ``(n,)`` boolean array of worlds to respawn, or None to respawn all of them.
 
         Returns:
-            The updated simulator data and ``(n, K, 3)`` goals.
+            The updated simulator data, ``(n, K, 3)`` goals and task.
         """
         # Handles the randomization of goal and position
         pos_key, vel_key, goal_key = jax.random.split(key, 3)
@@ -164,7 +174,7 @@ class DroneEnv:
             vel_key, shape, minval=-self.max_spawn_speed, maxval=self.max_spawn_speed
         )
 
-        new_goal = self.sample_goals(goal_key)
+        new_goal, new_task = self.sample_task(goal_key)
 
         data = self.sim._reset(data, self.sim.default_data, mask)
         spawn_state = {"pos": pos, "vel": vel}
@@ -172,21 +182,27 @@ class DroneEnv:
             spawn_state["rotor_vel"] = jnp.full((self.nr_envs, 1, 4), self.hover_rotor_vel)
         data = data.replace(states=leaf_replace(data.states, mask, **spawn_state))
 
-        goal = new_goal if mask is None else jnp.where(mask[:, None, None], new_goal, goal)
+        if mask is None:
+            return data, new_goal, new_task
 
-        return data, goal
+        def keep(new: jax.Array, old: jax.Array) -> jax.Array:
+            # New value in the masked worlds, broadcast over the trailing axes
+            return jnp.where(mask.reshape(mask.shape + (1,) * (new.ndim - 1)), new, old)
+
+        return data, keep(new_goal, goal), jax.tree.map(keep, new_task, task)
 
     def reset(self, keys: jax.Array) -> State:
         """Spawn all worlds and return the initial state."""
         # Only keys[0] is used, spawn randomizes all worlds from a single key
         key, spawn_key = jax.random.split(keys[0])
-        data, goal = self.spawn(self.sim.default_data, None, spawn_key)
+        data, goal, task = self.spawn(self.sim.default_data, None, None, spawn_key)
         zeros = jnp.zeros((self.nr_envs,), jnp.float32)
         pos, vel = data.states.pos[:, 0], data.states.vel[:, 0]
         return State(
             data=data,
             obs=self.observation(data, goal),
             goal=goal,
+            task=task,
             key=key,
             reward=zeros,
             done=zeros,
@@ -196,11 +212,16 @@ class DroneEnv:
                 "truncation": zeros,
                 "progress": jnp.zeros((self.nr_envs,), jnp.int32),
             },
-            metrics={**self.evaluation_step_metrics(pos, vel, goal[:, 0]), "sequence_done": zeros},
+            metrics={
+                **self.evaluation_step_metrics(pos, vel, goal[:, 0], task),
+                "sequence_done": zeros,
+                "waypoint_reached": jnp.zeros((self.nr_envs, self.nr_waypoints), jnp.float32),
+            },
         )
 
-    def terminated(self, pos: jax.Array, vel: jax.Array) -> jax.Array:
+    def terminated(self, data: SimData, task: dict) -> jax.Array:
         """Return the ``(n,)`` worlds whose drone left the bounds box or has a non-finite state."""
+        pos, vel = data.states.pos[:, 0], data.states.vel[:, 0]
         out_of_bounds = jnp.any((pos < self.bounds_low) | (pos > self.bounds_high), axis=-1)
         not_finite = ~jnp.all(jnp.isfinite(pos) & jnp.isfinite(vel), axis=-1)
         return out_of_bounds | not_finite
@@ -230,7 +251,7 @@ class DroneEnv:
 
         # 2. Check how episode ended
         pos, vel = data.states.pos[:, 0], data.states.vel[:, 0]
-        terminated = self.terminated(pos, vel)
+        terminated = self.terminated(data, state.task)
         steps = state.info["steps"] + 1.0
         truncated = (steps >= self.episode_length) & ~terminated
         done = terminated | truncated
@@ -244,16 +265,21 @@ class DroneEnv:
 
         # Measured before the autoreset, against the goal the drone was chasing
         metrics = {
-            **self.evaluation_step_metrics(pos, vel, state.goal[:, 0]),
+            **self.evaluation_step_metrics(pos, vel, state.goal[:, 0], state.task),
             "sequence_done": (progress >= self.nr_waypoints).astype(jnp.float32),
+            # (n, K), 1 from the step waypoint k is reached on
+            "waypoint_reached": (progress[:, None] > jnp.arange(self.nr_waypoints)).astype(
+                jnp.float32
+            ),
         }
 
         # 3. Autoreset the envs that ended
-        data, goal = self.spawn(data, goal, spawn_key, mask=done)
+        data, goal, task = self.spawn(data, goal, state.task, spawn_key, mask=done)
 
         return state.replace(
             data=data,
             goal=goal,
+            task=task,
             key=key,
             obs=self.observation(data, goal),
             reward=jnp.zeros_like(state.reward),  # the trainer reads this as a cost; none here
@@ -272,9 +298,9 @@ class DroneEnv:
         return {}
 
     def evaluation_step_metrics(
-        self, pos: jax.Array, vel: jax.Array, goal: jax.Array
+        self, pos: jax.Array, vel: jax.Array, goal: jax.Array, task: dict
     ) -> dict[str, jax.Array]:
-        """Per-world metrics for a single step.
+        """Per-world metrics for a single step, against the current ``goal`` of the ``task``.
 
         ``success``: within ``goal_radius`` of the goal. ``goal_error``: distance to the goal.
         """

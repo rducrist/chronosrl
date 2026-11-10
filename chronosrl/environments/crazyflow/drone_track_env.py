@@ -24,10 +24,10 @@ class DroneTrackEnv(DroneEnv):
         self.goal_clip = config.goal.clip
         assert self.goal_nominal.shape == (self.nr_waypoints, 3), "one nominal row per waypoint"
 
-    def sample_goals(self, key: jax.Array) -> jax.Array:
+    def sample_task(self, key: jax.Array) -> tuple[jax.Array, dict]:
         """Sample ``(n, K, 3)`` goals: the nominal waypoints plus noise clipped at ``clip`` std."""
         noise = jax.random.truncated_normal(
             key, -self.goal_clip, self.goal_clip, (self.nr_envs, self.nr_waypoints, 3)
         )
 
-        return self.goal_nominal + self.goal_std * noise
+        return self.goal_nominal + self.goal_std * noise, {}
