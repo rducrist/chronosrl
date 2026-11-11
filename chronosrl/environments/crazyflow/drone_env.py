@@ -218,8 +218,11 @@ class DroneEnv:
             },
         )
 
-    def terminated(self, data: SimData, task: dict) -> jax.Array:
-        """Return the ``(n,)`` worlds whose drone left the bounds box or has a non-finite state."""
+    def terminated(self, data: SimData, task: dict, goal: jax.Array) -> jax.Array:
+        """Return the ``(n,)`` worlds whose drone left the bounds box or has a non-finite state.
+
+        ``goal`` holds the ``(n, K, 3)`` goals chased in this step, unused here.
+        """
         pos, vel = data.states.pos[:, 0], data.states.vel[:, 0]
         out_of_bounds = jnp.any((pos < self.bounds_low) | (pos > self.bounds_high), axis=-1)
         not_finite = ~jnp.all(jnp.isfinite(pos) & jnp.isfinite(vel), axis=-1)
@@ -258,7 +261,7 @@ class DroneEnv:
 
         # 2. Check how episode ended
         pos, vel = data.states.pos[:, 0], data.states.vel[:, 0]
-        terminated = self.terminated(data, state.task)
+        terminated = self.terminated(data, state.task, state.goal)
         steps = state.info["steps"] + 1.0
         truncated = (steps >= self.episode_length) & ~terminated
         done = terminated | truncated
@@ -266,7 +269,7 @@ class DroneEnv:
         progress = state.info["progress"]
         length = self.sequence_length(state.task)
         at_goal = jnp.linalg.norm(pos - state.goal[:, 0], axis=-1) < self.goal_radius
-        passed = at_goal & (progress < length)
+        passed = at_goal & ~terminated & (progress < length)
         appended = self.next_goal(state.goal, state.task, progress)[:, None]
         popped = jnp.concatenate([state.goal[:, 1:], appended], axis=1)
         goal = jnp.where(passed[:, None, None], popped, state.goal)

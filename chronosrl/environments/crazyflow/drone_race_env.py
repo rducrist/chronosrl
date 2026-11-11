@@ -40,7 +40,8 @@ class DroneRaceEnv(DroneEnv):
             nr_envs: Number of parallel worlds, one drone each.
         """
         # Before super(): the base sizes the observation from it
-        self.state_dim = DroneEnv.state_dim + 6 * len(config.track.gates)
+        self.nr_gates, self.nr_obstacles = len(config.track.gates), len(config.track.obstacles)
+        self.state_dim = DroneEnv.state_dim + 6 * self.nr_gates + 2 * self.nr_obstacles
         super().__init__(config, nr_envs)
         track = config.track
         assert all(0 < g <= len(track.gates) for g in track.gate_order), "gate numbers are 1..G"
@@ -58,6 +59,8 @@ class DroneRaceEnv(DroneEnv):
         self.platform_probability = config.task.get("platform_probability", 0.5)
         # m/s, gate spawns start with a uniform speed up to this along the gate normal
         self.spawn_speed = config.task.get("spawn_speed", 0.0)
+        # End the episode when the drone reaches the next gate's centre flying against its normal
+        self.terminate_wrong_way = config.task.get("terminate_wrong_way", False)
 
         # Uniform noise half-widths per axis
         noise = track.noise
@@ -83,31 +86,35 @@ class DroneRaceEnv(DroneEnv):
         )
         return jnp.concatenate([task["gates_pos"], normal], axis=-1)
 
-    def add_gates(self, obs: jax.Array, task: dict) -> jax.Array:
-        """Insert the gate features between the drone state and the goals of a base ``obs``."""
+    def add_track(self, obs: jax.Array, task: dict) -> jax.Array:
+        """Insert the gate features and obstacle xy between the drone state and the goals."""
         n = DroneEnv.state_dim
-        gates = self.gate_features(task).reshape(obs.shape[0], -1).astype(obs.dtype)
-        return jnp.concatenate([obs[:, :n], gates, obs[:, n:]], axis=-1)
+        gates = self.gate_features(task).reshape(obs.shape[0], -1)
+        obstacles = task["obstacles_pos"][..., :2].reshape(obs.shape[0], -1)
+        track = jnp.concatenate([gates, obstacles], axis=-1).astype(obs.dtype)
+        return jnp.concatenate([obs[:, :n], track, obs[:, n:]], axis=-1)
 
     def reset(self, keys: jax.Array) -> State:
-        """Base reset with the gates in the observation."""
+        """Base reset with the gates and obstacles in the observation."""
         state = super().reset(keys)
-        return state.replace(obs=self.add_gates(state.obs, state.task))
+        return state.replace(obs=self.add_track(state.obs, state.task))
 
     def step(self, state: State, action: jax.Array) -> State:
-        """Base step with the gates in the observation."""
+        """Base step with the gates and obstacles in the observation."""
         next_state = super().step(state, action)
-        return next_state.replace(obs=self.add_gates(next_state.obs, next_state.task))
+        return next_state.replace(obs=self.add_track(next_state.obs, next_state.task))
 
     def policy_observation(self, obs: jax.Array) -> jax.Array:
-        """Goals relative to the drone, rotation and velocities, and the normal of each goal's gate.
+        """Goals relative to the drone, rotation and velocities, goal gate normals and obstacle xy.
 
         The gate of a goal is the one with the nearest centre, picked from the goals so it also
         follows relabeled goals.
         """
         n, batch = DroneEnv.state_dim, obs.shape[:-1]
+        m = n + 6 * self.nr_gates
         pos = obs[..., None, :3]
-        gates = obs[..., n : self.state_dim].reshape(batch + (-1, 6))
+        gates = obs[..., n:m].reshape(batch + (-1, 6))
+        obstacles = obs[..., m : self.state_dim].reshape(batch + (-1, 2))
         goals = obs[..., self.state_dim :].reshape(batch + (self.nr_waypoints, 3))
         distance = jnp.linalg.norm(goals[..., :, None, :] - gates[..., None, :, :3], axis=-1)
         near = jnp.take_along_axis(gates, jnp.argmin(distance, -1)[..., None], axis=-2)
@@ -116,6 +123,7 @@ class DroneRaceEnv(DroneEnv):
                 (pos - goals).reshape(batch + (-1,)),
                 obs[..., 3:n],
                 near[..., 3:].reshape(batch + (-1,)),
+                (pos[..., :2] - obstacles).reshape(batch + (-1,)),
             ],
             axis=-1,
         )
@@ -237,9 +245,22 @@ class DroneRaceEnv(DroneEnv):
         _, mjx_data = sync_sim2mjx(data, mjx_data, self.sim.mjx_model)
         return jnp.any((mjx_data._impl.contact.dist < 0) & self.contact_mask, axis=-1)
 
-    def terminated(self, data: SimData, task: dict) -> jax.Array:
-        """Base termination plus touching a gate or an obstacle."""
-        return super().terminated(data, task) | self.crashed(data, task)
+    def terminated(self, data: SimData, task: dict, goal: jax.Array) -> jax.Array:
+        """Base termination plus touching a gate or an obstacle, and optionally a wrong-way pass."""
+        terminated = super().terminated(data, task, goal) | self.crashed(data, task)
+        if self.terminate_wrong_way:
+            terminated |= self.wrong_way(data, task, goal)
+        return terminated
+
+    def wrong_way(self, data: SimData, task: dict, goal: jax.Array) -> jax.Array:
+        """Return the ``(n,)`` worlds reaching the next gate's centre flying against its normal."""
+        pos, vel = data.states.pos[:, 0], data.states.vel[:, 0]
+        at_goal = jnp.linalg.norm(pos - goal[:, 0], axis=-1) < self.goal_radius
+
+        gate = jnp.argmin(jnp.linalg.norm(task["gates_pos"] - goal[:, :1], axis=-1), axis=-1)
+        normal = self.gate_features(task)[jnp.arange(self.nr_envs), gate, 3:]
+
+        return at_goal & (jnp.sum(vel * normal, axis=-1) < 0.0)
 
     def evaluation_step_metrics(
         self, pos: jax.Array, vel: jax.Array, goal: jax.Array, task: dict

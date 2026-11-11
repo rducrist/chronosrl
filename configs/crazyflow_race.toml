@@ -7,7 +7,7 @@
 [runner]
 exp_name = "crazyflow_race"
 checkpoint_every = 10 # keep checkpoints/epoch_<N>.pkl every N epochs (0: only the latest model.pkl)
-tag = ""
+tag = "best_run_aggressive_angle"
 
 # Applied to every algorithm
 [algorithm]
@@ -16,7 +16,8 @@ cost_weight = 0.0
 goal_sequence_length = 1
 name = "srl"
 window = 1000
-total_timesteps = 50_000_000
+total_timesteps = 200_000_000
+depth = 16
 
 [environment]
 name = "crazyflow_race"
@@ -45,7 +46,7 @@ force_noise = 0.05    # N std per sim step
 torque_noise = 0.001  # Nm std per sim step
 
 [environment.action]
-max_angle = 0.5236 # rad, limit for roll/pitch/yaw commands
+max_angle = 0.785 # rad, limit for roll/pitch/yaw commands
 zero_yaw = true # hold the yaw command at 0, the policy outputs [roll, pitch, thrust]
 delta = true # the policy outputs a change to the last action
 max_delta = 0.2 # max change per policy step, in [-1, 1] action units
@@ -58,6 +59,7 @@ spawn_at_gates = true # also spawn in front of gate pass j - 1, with the window 
 eval_spawn_at_gates = false # eval and rollout start on the platform
 platform_probability = 0.5 # with spawn_at_gates: share of starts on the platform, the rest uniform over the gates
 spawn_speed = 0.0 # m/s, with spawn_at_gates: gate spawns start with a uniform speed up to this into the gate
+terminate_wrong_way = true # end the episode when the drone reaches the next gate's centre flying against its normal
 
 # Episodes terminate when the drone leaves this box (the lsy pos limits) or touches the track
 [environment.bounds]
@@ -93,13 +95,13 @@ pos = [0.0, -0.75, 1.2]
 rpy = [0.0, 0.0, 0.0]
 
 [[environment.track.obstacles]]
-pos = [0.0, 0.75, -1.55]
+pos = [0.0, 0.75, 1.55]
 [[environment.track.obstacles]]
-pos = [1.0, 0.25, -1.55]
+pos = [1.0, 0.25, 1.55]
 [[environment.track.obstacles]]
-pos = [-1.5, -0.25, -1.55]
+pos = [-1.5, -0.25, 1.55]
 [[environment.track.obstacles]]
-pos = [-0.5, -0.75, -1.55]
+pos = [-0.5, -0.75, 1.55]
 
 # Uniform noise half-widths per axis, the level2 randomizations
 [environment.track.noise]
