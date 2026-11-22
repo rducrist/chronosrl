@@ -11,13 +11,13 @@ if not hasattr(mjx, "ncon"):
     mjx.ncon = lambda sys: mjx.make_data(sys).ncon
 
 TASKS = {
-    "ant_u4_maze": lambda: AntMaze("u4_maze"),
-    "ant_big_maze": lambda: AntMaze("big_maze"),
-    "ant_hardest_maze": lambda: AntMaze("hardest_maze"),
-    "ant_u5_maze": lambda: AntMaze("u5_maze"),
-    "humanoid": lambda: Humanoid(),
-    "humanoid_u_maze": lambda: HumanoidMaze("u_maze"),
-    "humanoid_big_maze": lambda: HumanoidMaze("big_maze"),
+    "ant_u4_maze": lambda config: AntMaze("u4_maze"),
+    "ant_big_maze": lambda config: AntMaze("big_maze"),
+    "ant_hardest_maze": lambda config: AntMaze("hardest_maze"),
+    "ant_u5_maze": lambda config: AntMaze("u5_maze"),
+    "humanoid": lambda config: Humanoid(),
+    "humanoid_u_maze": lambda config: HumanoidMaze("u_maze"),
+    "humanoid_big_maze": lambda config: HumanoidMaze("big_maze"),
 }
 
 
@@ -29,7 +29,16 @@ class EvalWrapper(envs.training.EvalWrapper):
 
 
 # Hyperparameters live in configs/<environment_name>.toml
+def eval_config(config):
+    """Copy of the env ``config`` with ``task.eval_goal_radius`` in place of ``task.goal_radius``."""
+    config = config.copy_and_resolve_references()
+    if "task" in config and "eval_goal_radius" in config.task:
+        config.task.goal_radius = config.task.eval_goal_radius
+    return config
+
+
 def create_env(config):
-    train_env = envs.training.wrap(TASKS[config.environment.name](), episode_length=config.environment.episode_length)
-    eval_env = EvalWrapper(envs.training.wrap(TASKS[config.environment.name](), episode_length=config.environment.episode_length))
+    env_config = config.environment
+    train_env = envs.training.wrap(TASKS[env_config.name](env_config), episode_length=env_config.episode_length)
+    eval_env = EvalWrapper(envs.training.wrap(TASKS[env_config.name](eval_config(env_config)), episode_length=env_config.episode_length))
     return train_env, eval_env

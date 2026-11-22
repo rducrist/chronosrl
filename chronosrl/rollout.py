@@ -532,7 +532,10 @@ def main():
             return obs
 
     else:
-        env = environment_module.TASKS[name]()
+        from ml_collections import config_dict
+
+        env_config = environment_module.eval_config(config_dict.ConfigDict(config["environment"]))
+        env = environment_module.TASKS[name](env_config)
         policy = Policy(env.action_size * chunk_length, algorithm["width"], algorithm["depth"])
         params = checkpoint["policy"]
         policy_observation = env.policy_observation
