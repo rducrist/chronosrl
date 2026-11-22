@@ -4,6 +4,7 @@ from brax import envs
 
 from chronosrl.environments.jaxgcrl.ant_maze import AntMaze
 from chronosrl.environments.jaxgcrl.humanoid import Humanoid, HumanoidMaze
+from chronosrl.environments.jaxgcrl.manipulation.arm_push_easy import ArmPushEasy
 
 
 # brax 0.10.1 still calls mjx.ncon, which MuJoCo 3.2 removed
@@ -18,6 +19,7 @@ TASKS = {
     "humanoid": lambda config: Humanoid(),
     "humanoid_u_maze": lambda config: HumanoidMaze("u_maze"),
     "humanoid_big_maze": lambda config: HumanoidMaze("big_maze"),
+    "arm_push_easy": lambda config: ArmPushEasy(config),
 }
 
 
