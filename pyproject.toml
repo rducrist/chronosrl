@@ -62,6 +62,22 @@ go2 = [
     "scipy==1.17.1",
 ]
 
+# Arm manipulation tasks on MJX with the MuJoCo Warp backend; brax only for env wrappers
+manipulation = [
+    "jax==0.7.2",
+    "jaxlib==0.7.2",
+    "flax==0.12.0",
+    "optax==0.2.8",
+    "chex==0.1.92",
+    "brax==0.14.2",
+    "mujoco==3.7.0",
+    "mujoco-mjx==3.7.0",
+    "mujoco-warp==3.7.0.1",
+    "warp-lang==1.12.1",
+    "numpy==2.4.6",
+    "scipy==1.17.1",
+]
+
 [tool.setuptools.packages.find]
 include = ["chronosrl*"]
 
@@ -78,6 +94,7 @@ chronosrl = { path = ".", editable = true }
 [tool.pixi.environments]
 benchmark = { features = ["benchmark"] }
 go2 = { features = ["go2"] }
+manipulation = { features = ["manipulation"] }
 
 [tool.pixi.environments.crazyflow]
 features = ["crazyflow"]
@@ -128,8 +145,15 @@ python = "3.11.*"
 [tool.pixi.feature.go2.pypi-dependencies]
 jax = { version = "==0.7.2", extras = ["cuda12"] }
 
+[tool.pixi.feature.manipulation.dependencies]
+python = "3.11.*"
+
+[tool.pixi.feature.manipulation.pypi-dependencies]
+jax = { version = "==0.7.2", extras = ["cuda12"] }
+
 [tool.pixi.dependencies]
 ipython = ">=8.37.0,<10"
+pytest = ">=9.2.0,<10"
 
 [tool.ruff]
 # Exclude a variety of commonly ignored directories.
