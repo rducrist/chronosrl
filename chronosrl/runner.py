@@ -30,6 +30,8 @@ def get_runner_config() -> config_dict.ConfigDict:
     config.save_model = True
     # Keep checkpoints/epoch_<N>.pkl every N epochs and after the last one; 0: only model.pkl
     config.checkpoint_every = 1
+    # Print and log timing/throughput metrics (compile, prefill, env step, update, eval, ...)
+    config.debug = False
 
     return config
 

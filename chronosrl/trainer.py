@@ -58,6 +58,7 @@ class Trainer:
         self.save_model = config.runner.save_model
         self.checkpoint_every = config.runner.checkpoint_every
         self.track_wandb = config.runner.track_wandb
+        self.debug = config.runner.debug
         self.seed = config.environment.seed
         self.nr_envs = config.environment.nr_envs
         self.nr_eval_envs = config.environment.nr_eval_envs
@@ -218,7 +219,8 @@ class Trainer:
                 action, chunk, chunk_index = self.act(
                     policy_params, env_state, chunk, chunk_index, subkey
                 )
-                next_env_state = self.train_env.step(env_state, action)
+                with jax.named_scope("env_step"):
+                    next_env_state = self.train_env.step(env_state, action)
                 # Truncation is read from the pre-step state, so an episode's truncation
                 # flag lands on the transition after its done one (see relabeling).
                 transition = {
@@ -335,12 +337,16 @@ class Trainer:
             """Collect one unroll, insert it into the buffer and train on sampled batches."""
             policy_state, critic_state, alpha_state, env_state, buffer_state, key = carry
             key, collect_key, sample_key, update_key = jax.random.split(key, 4)
-            env_state, transitions = collect(policy_state.params, env_state, collect_key)
+            # Named scopes group the ops in the profiler trace (runner.debug).
+            with jax.named_scope("collect"):
+                env_state, transitions = collect(policy_state.params, env_state, collect_key)
             buffer_state = self.replay_buffer.insert(buffer_state, transitions)
-            batches = sample_batches(buffer_state, sample_key)
-            (policy_state, critic_state, alpha_state, _), metrics = jax.lax.scan(
-                update, (policy_state, critic_state, alpha_state, update_key), batches
-            )
+            with jax.named_scope("sample_relabel"):
+                batches = sample_batches(buffer_state, sample_key)
+            with jax.named_scope("update"):
+                (policy_state, critic_state, alpha_state, _), metrics = jax.lax.scan(
+                    update, (policy_state, critic_state, alpha_state, update_key), batches
+                )
             return (policy_state, critic_state, alpha_state, env_state, buffer_state, key), metrics
 
         @jax.jit
@@ -370,12 +376,24 @@ class Trainer:
             )
             return env_state, buffer_state
 
+        if self.debug:
+            # Logs every XLA compilation with its duration.
+            jax.config.update("jax_log_compiles", True)
         evaluate = jax.jit(self.evaluate)
         self.key, env_key, eval_key, prefill_key, train_key = jax.random.split(self.key, 5)
         env_state = jax.jit(self.train_env.reset)(jax.random.split(env_key, self.nr_envs))
+        if self.debug:
+            print(f"Prefill started ({self.nr_prefill_steps} unrolls)", flush=True)
+            start_time = time.perf_counter()
         env_state, buffer_state = prefill(
             self.policy_state.params, env_state, self.replay_buffer.init(), prefill_key
         )
+        if self.debug:
+            jax.block_until_ready(buffer_state)
+            print(
+                f"Prefill done in {time.perf_counter() - start_time:.2f}s (incl. compilation)",
+                flush=True,
+            )
         carry = (
             self.policy_state,
             self.critic_state,
@@ -388,20 +406,24 @@ class Trainer:
         del env_state, buffer_state
         env_steps = self.nr_prefill_steps * self.env_steps_per_training_step
 
+        # With runner.debug, one epoch (the second, so compilation is not in it) is profiled;
+        # view it with `xprof <run_path>/profile` or TensorBoard's profile plugin.
+        profiled_epoch = min(1, self.nr_epochs - 1) if self.debug else -1
+
         # Evaluate before every epoch and once more after the last one. `epoch` counts the
         # completed epochs, so an epoch's train line and the eval after it share the number.
         for epoch in range(self.nr_epochs + 1):
             eval_key, subkey = jax.random.split(eval_key)
-            self.log(
-                {
-                    "eval/" + name: value
-                    for name, value in evaluate(carry[0].params, subkey).items()
-                },
-                env_steps,
-                epoch,
-            )
+            start_time = time.perf_counter()
+            eval_metrics = jax.block_until_ready(evaluate(carry[0].params, subkey))
+            eval_metrics = {"eval/" + name: value for name, value in eval_metrics.items()}
+            if self.debug:
+                eval_metrics["time/eval"] = time.perf_counter() - start_time
+            self.log(eval_metrics, env_steps, epoch)
             if epoch == self.nr_epochs:
                 break
+            if epoch == profiled_epoch:
+                jax.profiler.start_trace(os.path.join(self.run_path, "profile"))
             start_time = time.time()
             carry, metrics = training_epoch(carry)
             metrics = jax.tree_util.tree_map(
@@ -414,6 +436,11 @@ class Trainer:
                 * self.env_steps_per_training_step
                 / (time.time() - start_time)
             )
+            if self.debug:
+                metrics["time/epoch"] = time.time() - start_time
+            if epoch == profiled_epoch:
+                # After the timings, which would otherwise include writing the trace.
+                jax.profiler.stop_trace()
             self.log(metrics, env_steps, epoch + 1)
             if self.save_model:
                 # model.pkl always holds the latest epoch; every `checkpoint_every` epochs
