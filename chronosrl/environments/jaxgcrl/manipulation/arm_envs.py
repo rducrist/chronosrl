@@ -1,15 +1,22 @@
+import dataclasses
 import os
 
 from brax import base
 from brax.envs.base import PipelineEnv, State
 from brax.io import mjcf
+from brax.mjx import base as brax_mjx
 import mujoco
+from mujoco import mjx
 import jax
 from jax import numpy as jnp
 
 _ASSETS_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "assets"
 )
+
+# MuJoCo Warp buffer sizes per env; overflowing contacts are dropped with a printed warning
+_NCONMAX_PER_ENV = 64
+_NJMAX_PER_ENV = 256
 
 
 def asset_path(name: str) -> str:
@@ -25,16 +32,18 @@ class ArmEnvs(PipelineEnv):
         # Configure environment information (e.g. env name, noise scale, observation dimension, goal indices) and load XML
         self._set_environment_attributes()
         xml_path = self._get_xml_path()
-        sys = mjcf.load(xml_path)
+        mj_model = mjcf.load_mjmodel(xml_path)
 
         # Configure backend
-        sys = sys.tree_replace(
-            {
-                "opt.timestep": config.timestep,
-                "opt.iterations": 6,
-                "opt.ls_iterations": 12,
-            }
-        )
+        mj_model.opt.timestep = config.timestep
+        mj_model.opt.iterations = 6
+        mj_model.opt.ls_iterations = 12
+        # Physics runs on MuJoCo Warp; the brax sys only carries model metadata and the viewer
+        sys = mjcf.load_model(mj_model)
+        self._mj_model = mj_model
+        self._warp_model = mjx.put_model(mj_model, impl="warp")
+        # Under vmap all envs share one contact buffer, so size it for the largest batch
+        self._naconmax = _NCONMAX_PER_ENV * max(config.nr_envs, config.nr_eval_envs)
         self.n_frames = config.n_frames
         kwargs["n_frames"] = kwargs.get("n_frames", self.n_frames)
 
@@ -42,6 +51,32 @@ class ArmEnvs(PipelineEnv):
         if backend != "mjx":
             raise Exception("Use the mjx backend for stability/reasonable speed.")
         super().__init__(sys=sys, backend=backend, **kwargs)
+
+    def pipeline_init(self, q: jax.Array, qd: jax.Array) -> base.State:
+        """brax's mjx pipeline.init, on the Warp model."""
+        data = mjx.make_data(
+            self._mj_model, impl="warp", naconmax=self._naconmax, njmax=_NJMAX_PER_ENV
+        )
+        data = mjx.forward(self._warp_model, data.replace(qpos=q, qvel=qd))
+        return self._brax_state(data)
+
+    def pipeline_step(self, pipeline_state: base.State, action: jax.Array) -> base.State:
+        """n_frames Warp physics steps holding ``action`` as the control."""
+        data = mjx.Data(**{f.name: getattr(pipeline_state, f.name) for f in dataclasses.fields(mjx.Data)})
+        data = data.replace(ctrl=action)
+        data = jax.lax.fori_loop(
+            0, self._n_frames, lambda _, d: mjx.step(self._warp_model, d), data
+        )
+        return self._brax_state(data)
+
+    def _brax_state(self, data: mjx.Data) -> base.State:
+        """Adds brax's q, qd and per-link x, xd views to ``data``, as brax's mjx pipeline does."""
+        x = base.Transform(pos=data.xpos[1:], rot=data.xquat[1:])
+        cvel = base.Motion(vel=data.cvel[1:, 3:], ang=data.cvel[1:, :3])
+        offset = data.xpos[1:] - data.subtree_com[self._mj_model.body_rootid[1:]]
+        xd = base.Transform.create(pos=offset).vmap().do(cvel)
+        # Warp keeps its contacts in data._impl, and nothing here reads brax's contact view
+        return brax_mjx.State(q=data.qpos, qd=data.qvel, x=x, xd=xd, contact=None, **data.__dict__)
 
     def reset(self, rng: jax.Array) -> State:
         """Resets the environment to an initial state."""
