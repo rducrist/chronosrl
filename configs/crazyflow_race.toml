@@ -7,22 +7,22 @@
 [runner]
 exp_name = "crazyflow_race"
 checkpoint_every = 10 # keep checkpoints/epoch_<N>.pkl every N epochs (0: only the latest model.pkl)
-tag = "best_run_aggressive_angle"
+tag = "goal_occupancy"
 
 # Applied to every algorithm
 [algorithm]
 action_chunk_length = 1
 cost_weight = 0.0
-goal_sequence_length = 1
+goal_sequence_length = 4
 name = "srl"
 window = 1000
 total_timesteps = 200_000_000
-depth = 16
+depth = 32
 
 [environment]
 name = "crazyflow_race"
 seed = 1000
-nr_envs = 512
+nr_envs = 1024
 nr_eval_envs = 100
 episode_length = 500
 freq = 50
@@ -58,7 +58,7 @@ nr_waypoints = 2 # horizon: the next n gate centres
 spawn_at_gates = true # also spawn in front of gate pass j - 1, with the window starting at it
 eval_spawn_at_gates = false # eval and rollout start on the platform
 platform_probability = 0.5 # with spawn_at_gates: share of starts on the platform, the rest uniform over the gates
-spawn_speed = 0.0 # m/s, with spawn_at_gates: gate spawns start with a uniform speed up to this into the gate
+spawn_speed = 1.0 # m/s, with spawn_at_gates: gate spawns start with a uniform speed up to this into the gate
 terminate_wrong_way = true # end the episode when the drone reaches the next gate's centre flying against its normal
 
 # Episodes terminate when the drone leaves this box (the lsy pos limits) or touches the track
