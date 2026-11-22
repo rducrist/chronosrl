@@ -1,0 +1,48 @@
+# JaxGCRL arm_binpick_hard: pick the cube from the blue bin and place it in the red bin.
+
+[runner]
+exp_name = "arm_binpick_hard"
+checkpoint_every = 10 # keep checkpoints/epoch_<N>.pkl every N epochs (0: only the latest model.pkl)
+tag = "" # optional suffix of the run name
+action_chunk_length = 1
+cost_weight = 0.0
+
+[algorithm]
+goal_sequence_length = 1
+name = "srl"
+window = 1000
+total_timesteps = 30_000_000
+depth = 32
+batch_size = 1024
+nr_epochs = 150
+
+[environment]
+name = "arm_binpick_hard"
+seed = 1000
+nr_envs = 512
+nr_eval_envs = 100
+episode_length = 80 # JaxGCRL's binpick length, 4 s at the step below
+timestep = 0.002 # s, mjx step
+n_frames = 25    # mjx steps per env step, 0.05 s (20 Hz) with the timestep above
+
+[environment.action]
+delta = false     # the arm actions target an offset from the current joint angles
+max_delta = 0.5   # with delta: an action of +-1 targets this fraction of the joint range away
+
+[environment.task]
+goal_radius = 0.1       # m, cube to goal, training and relabeling
+eval_goal_radius = 0.1  # m, eval and rollout only
+easy_goal_radius = 0.3  # m, success_easy metric
+hard_goal_radius = 0.03 # m, success_hard metric
+lift_height = 0.15      # m above the sampled cube spawn position
+
+# Arm joint angles (7) and finger offsets (2) at reset, start close to the blue bin
+[environment.spawn]
+arm_q = [1.571, 0.742, 0.0, -1.571, 0.0, 3.054, 1.449, 0.04, 0.04]
+arm_noise = 0.0   # rad / m, uniform half-width on every arm entry
+cube_noise = 0.15 # m, uniform half-width on the cube xy around its xml position
+
+# Cube goal in the red bin
+[environment.goal]
+pos = [0.3, 0.6, 0.03]
+noise = 0.15 # m, uniform half-width on the goal xy
